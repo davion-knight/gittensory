@@ -6616,7 +6616,7 @@ describe("queue processors", () => {
       const url = input.toString();
       const method = init?.method ?? "GET";
       if (url === "https://api.gittensor.io/miners") return Response.json([]);
-      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
       if (url.includes("/users/")) return Response.json({ login: "newbie", created_at: createdAt });
       if (url.includes(`/pulls/${prNumber}/files`)) return Response.json([{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 0, changes: 1, patch: "@@\n+const ok = true;" }]);
       if (url.includes(`/pulls/${prNumber}/reviews`)) return Response.json([]);
@@ -6726,7 +6726,7 @@ describe("queue processors", () => {
       const url = input.toString();
       const method = init?.method ?? "GET";
       if (url === "https://api.gittensor.io/miners") return Response.json([]);
-      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
       if (url.includes("/users/")) return Response.json({ login: "JSONbored", created_at: new Date().toISOString() });
       if (url.includes("/pulls/66/files")) return Response.json([{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 0, changes: 1, patch: "@@\n+const ok = true;" }]);
       if (url.includes("/pulls/66/reviews")) return Response.json([]);
@@ -6755,6 +6755,123 @@ describe("queue processors", () => {
     expect(seen.labels).not.toContain("new-account");
   });
 
+  it("account-age throttle (#2561): an ADMIN_GITHUB_LOGINS fleet-operator's brand-new PR is never labeled", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem(), ADMIN_GITHUB_LOGINS: "fleet-operator" });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      autonomy: { close: "auto", label: "auto" },
+      accountAgeThresholdDays: 30,
+    });
+    const seen = { labels: [] as string[], closed: false };
+    vi.stubGlobal("fetch", stubAccountAgeFetch(70, new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(), seen));
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-admin-exempt",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 70, title: "Fleet operator's PR", state: "open", user: { login: "fleet-operator" }, head: { sha: "s70" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.labels).not.toContain("new-account");
+  });
+
+  it("account-age throttle (#2561): a protected automation bot's brand-new PR is never labeled", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      autonomy: { close: "auto", label: "auto" },
+      accountAgeThresholdDays: 30,
+    });
+    const seen = { labels: [] as string[], closed: false };
+    vi.stubGlobal("fetch", stubAccountAgeFetch(71, new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(), seen));
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-bot-exempt",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 71, title: "Dependabot PR", state: "open", user: { login: "dependabot[bot]" }, head: { sha: "s71" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.labels).not.toContain("new-account");
+  });
+
+  it("account-age throttle (#2561): autoCloseExemptLogins also exempts a below-threshold-age account from the label AND the tightened cap", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    // Two pre-existing open PRs — a cap of 4 (which WOULD tighten to 2 for a new account) means the 3rd PR
+    // would normally close under the tightened cap, but the exemption must suppress BOTH the label and the
+    // tightening, leaving the RAW cap of 4 in effect (not yet exceeded by a 3rd PR).
+    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 72, title: "Exempt newbie PR one", state: "open", user: { login: "trusted-newbie" }, head: { sha: "s72" }, labels: [], body: "x" });
+    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 73, title: "Exempt newbie PR two", state: "open", user: { login: "trusted-newbie" }, head: { sha: "s73" }, labels: [], body: "y" });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      autonomy: { close: "auto", label: "auto" },
+      contributorOpenPrCap: 4,
+      accountAgeThresholdDays: 30,
+      autoCloseExemptLogins: ["trusted-newbie"],
+    });
+    const seen = { labels: [] as string[], closed: false };
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "https://api.gittensor.io/miners") return Response.json([]);
+      if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
+      if (url.includes("/users/")) return Response.json({ login: "trusted-newbie", created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString() });
+      if (url.includes("/pulls/74/files")) return Response.json([{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 0, changes: 1, patch: "@@\n+const ok = true;" }]);
+      if (url.includes("/pulls/74/reviews")) return Response.json([]);
+      if (url.includes("/pulls/74/commits")) return Response.json([]);
+      if (url.endsWith("/pulls/74") && method === "PATCH") { seen.closed = JSON.parse(String(init?.body ?? "{}")).state === "closed"; return Response.json({ number: 74, state: "closed" }); }
+      if (url.endsWith("/pulls/74")) return Response.json({ number: 74, state: "open", user: { login: "trusted-newbie" }, head: { sha: "s74" }, mergeable_state: "clean" });
+      if (url.includes("/commits/s74/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/commits/s74/status")) return Response.json({ state: "success", statuses: [] });
+      if (url.includes("/issues/74/labels")) return Response.json([]);
+      if (url.includes("/issues/74/comments")) return Response.json([]);
+      return Response.json({});
+    });
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-exempt-logins",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 74, title: "Trusted newbie's 3rd PR", state: "open", user: { login: "trusted-newbie" }, head: { sha: "s74" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.labels).not.toContain("new-account");
+    expect(seen.closed).toBe(false);
+  });
+
   it("account-age throttle (#2561): disabled (no threshold configured, the default) never fetches the GitHub user or labels", async () => {
     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
     await upsertInstallation(env, {
@@ -6773,7 +6890,7 @@ describe("queue processors", () => {
       const url = input.toString();
       const method = init?.method ?? "GET";
       if (url === "https://api.gittensor.io/miners") return Response.json([]);
-      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
       // Distinct from the UNRELATED, always-on public-contributor-profile lookup (src/github/public.ts), which
       // hits this same bare /users/{login} URL but with NO authorization header (GITHUB_PUBLIC_TOKEN unset in
       // this test) — only getGithubUserCreatedAt's account-age-specific call sends a Bearer installation token.

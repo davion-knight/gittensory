@@ -634,7 +634,7 @@ describe("GitHub check runs", () => {
 
     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
       const url = input.toString();
-      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
       if (url.includes("/users/newbie")) return Response.json({ login: "newbie", created_at: "2026-06-01T00:00:00Z" });
       if (url.includes("/users/missing-field")) return Response.json({ login: "missing-field" });
       if (url.includes("/users/malformed-field")) return Response.json({ login: "malformed-field", created_at: 12345 });

@@ -1983,14 +1983,23 @@ async function runAgentMaintenancePlanAndExecute(
   // (a banned login gets a fresh account the same day) — NEVER an automatic close on account age alone. Off
   // (null accountAgeThresholdDays, the default) ⇒ this block is a no-op, no extra GitHub API call at all.
   // Fires for a CONTRIBUTOR only — same standing owner/admin/automation-bot exemption as every other
-  // anti-abuse mechanism above. The label is applied directly (fire-and-forget, matching mode gating) rather
-  // than threaded through the planner: this is advisory/visibility only, independent of the merit/CI/AI
-  // disposition the planner computes below. Gate finding: a direct label mutation still needs the SAME
-  // label-autonomy opt-in every other label write goes through (resolveAutonomy(..., "label") === "auto") —
-  // a repo that has not opted into automatic label actions must not have this throttle silently write labels.
+  // anti-abuse mechanism above, PLUS the shared autoCloseExemptLogins list (gate finding) so an explicitly
+  // trusted regular is never throttled or labeled by this mechanism either. The label is applied directly
+  // (fire-and-forget, matching mode gating) rather than threaded through the planner: this is
+  // advisory/visibility only, independent of the merit/CI/AI disposition the planner computes below. Gate
+  // finding: a direct label mutation still needs the SAME label-autonomy opt-in every other label write goes
+  // through (resolveAutonomy(..., "label") === "auto") — a repo that has not opted into automatic label
+  // actions must not have this throttle silently write labels.
   let isNewAccount = false;
   const accountAgeThresholdDays = settings.accountAgeThresholdDays;
-  if (typeof accountAgeThresholdDays === "number" && pr.authorLogin && !authorIsOwner && !authorIsAdmin && !authorIsAutomationBot) {
+  if (
+    typeof accountAgeThresholdDays === "number" &&
+    pr.authorLogin &&
+    !authorIsOwner &&
+    !authorIsAdmin &&
+    !authorIsAutomationBot &&
+    !isAutoCloseExempt(pr.authorLogin, settings.autoCloseExemptLogins)
+  ) {
     const createdAt = await getGithubUserCreatedAt(env, installationId, pr.authorLogin);
     if (createdAt) {
       const ageDays = (Date.now() - Date.parse(createdAt)) / (24 * 60 * 60 * 1000);
