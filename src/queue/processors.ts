@@ -5458,6 +5458,13 @@ export async function runAiReviewForAdvisory(
       onMerge: args.settings.aiReviewOnMerge ?? undefined,
       reviewers: args.settings.aiReviewReviewers ?? undefined,
       securityFocus: args.reviewSecurityFocus === true,
+      // Per-repo dual-AI combine/onMerge/reviewers overrides (#2567), resolved by resolveEffectiveSettings from
+      // `.gittensory.yml gate.aiReview.*` onto `args.settings`. Absent ⇒ undefined ⇒ runGittensoryAiReview falls
+      // back to the operator's AI_REVIEW_PLAN (byte-identical to today). `onMerge` is clamped to the operator's
+      // floor INSIDE runGittensoryAiReview (resolveEffectiveAiReviewOnMerge), not here.
+      combine: args.settings.aiReviewCombine ?? undefined,
+      onMerge: args.settings.aiReviewOnMerge ?? undefined,
+      reviewers: args.settings.aiReviewReviewers ?? undefined,
       // Inline comments (#inline-comments): ask the model for line-anchored findings only when the operator flag,
       // the cutover allowlist, AND the per-repo manifest toggle all pass. Otherwise the prompt is byte-identical.
       inlineFindings: shouldRequestInlineFindings(
