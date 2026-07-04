@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_REVIEW_NAG_COOLDOWN_DAYS } from "../settings/agent-actions";
 import { extendZodWithOpenApi } from "@asteasolutions/zod-to-openapi";
 
 extendZodWithOpenApi(z);
@@ -596,6 +597,12 @@ export const RepositorySettingsSchema = z
     qualityGateMinScore: z.number().nullable().optional(),
     slopGateMode: z.enum(["off", "advisory", "block"]),
     sizeGateMode: z.enum(["off", "advisory", "block"]).optional(),
+    lockfileIntegrityGateMode: z.enum(["off", "advisory", "block"]).optional(),
+    claGateMode: z.enum(["off", "advisory", "block"]).optional(),
+    claConsentPhrase: z.string().nullable().optional(),
+    claCheckRunName: z.string().nullable().optional(),
+    claCheckRunAppSlug: z.string().nullable().optional(),
+    expectedCiContexts: z.array(z.string()).optional(),
     gateDryRun: z.boolean().optional(),
     premergeContentRecheck: z.boolean().optional(),
     requireFreshRebaseWindowMinutes: z.number().int().positive().nullable().optional(),
@@ -611,10 +618,25 @@ export const RepositorySettingsSchema = z
     aiReviewModel: z.string().nullable().optional(),
     aiReviewAllAuthors: z.boolean(),
     aiReviewCloseConfidence: z.number().nullable().optional(),
+    aiReviewCombine: z.enum(["single", "consensus", "synthesis"]).nullable().optional(),
+    aiReviewOnMerge: z.enum(["either", "both"]).nullable().optional(),
+    aiReviewReviewers: z
+      .array(z.object({ model: z.string(), fallback: z.string().nullable().optional() }))
+      .nullable()
+      .optional(),
     closeOwnerAuthors: z.boolean(),
     autoLabelEnabled: z.boolean(),
+    typeLabelsEnabled: z.boolean(),
+    typeLabels: z.object({ bug: z.string(), feature: z.string(), priority: z.string() }).optional(),
+    linkedIssueLabelPropagation: z
+      .object({
+        enabled: z.boolean(),
+        mode: z.enum(["exclusive_type_label"]),
+        mappings: z.array(z.object({ issueLabel: z.string(), prLabel: z.string(), removeOtherTypeLabels: z.boolean() })),
+      })
+      .optional(),
     gittensorLabel: z.string(),
-    blacklistLabel: z.string(),
+    blacklistLabel: z.string().nullable(),
     createMissingLabel: z.boolean(),
     publicSurface: z.enum(["off", "comment_and_label", "comment_only", "label_only"]),
     includeMaintainerAuthors: z.boolean(),
@@ -637,21 +659,31 @@ export const RepositorySettingsSchema = z
       )
       .optional(),
     autonomy: z
-      .record(z.enum(["review", "request_changes", "approve", "merge", "close", "label"]), z.enum(["observe", "suggest", "propose", "auto_with_approval", "auto"]))
+      .record(z.enum(["review", "request_changes", "approve", "merge", "close", "label", "review_state_label"]), z.enum(["observe", "suggest", "propose", "auto_with_approval", "auto"]))
       .optional(),
     autoMaintain: z.object({ requireApprovals: z.number().int(), mergeMethod: z.enum(["merge", "squash", "rebase"]) }).optional(),
     agentPaused: z.boolean().optional(),
     agentDryRun: z.boolean().optional(),
     contributorOpenPrCap: z.number().int().positive().nullable().optional(),
     contributorOpenIssueCap: z.number().int().positive().nullable().optional(),
-    contributorCapLabel: z.string().optional(),
+    contributorCapLabel: z.string().nullable().optional(),
+    contributorCapCancelCi: z.boolean().nullable().optional(),
     reviewNagPolicy: z.enum(["off", "hold", "close"]).optional(),
     reviewNagMaxPings: z.number().int().positive().optional(),
-    reviewNagCooldownDays: z.number().int().positive().optional(),
-    reviewNagLabel: z.string().optional(),
+    reviewNagCooldownDays: z.number().int().positive().max(MAX_REVIEW_NAG_COOLDOWN_DAYS).optional(),
+    reviewNagLabel: z.string().nullable().optional(),
+    reviewNagMonitoredMentions: z.array(z.string()).optional(),
     autoCloseExemptLogins: z.array(z.string()).optional(),
     accountAgeThresholdDays: z.number().int().positive().nullable().optional(),
     newAccountLabel: z.string().optional(),
+    commandRateLimitPolicy: z.enum(["off", "hold"]).optional(),
+    commandRateLimitMaxPerWindow: z.number().int().positive().optional(),
+    commandRateLimitAiMaxPerWindow: z.number().int().positive().optional(),
+    commandRateLimitWindowHours: z.number().int().positive().optional(),
+    moderationGateMode: z.enum(["inherit", "off", "enabled"]).optional(),
+    moderationRules: z.array(z.enum(["contributor_cap", "blacklist", "review_nag"])).optional(),
+    moderationWarningLabel: z.string().optional(),
+    moderationBannedLabel: z.string().optional(),
     createdAt: z.string().nullable().optional(),
     updatedAt: z.string().nullable().optional(),
   })
@@ -681,6 +713,7 @@ export const RepoSettingsPreviewSchema = z
       firstTimeContributorGrace: z.boolean(),
       slopGateMinScore: z.number().nullable().optional(),
       autoLabelEnabled: z.boolean(),
+      typeLabelsEnabled: z.boolean(),
       gittensorLabel: z.string(),
       blacklistLabel: z.string(),
       createMissingLabel: z.boolean(),
@@ -1016,6 +1049,10 @@ export const InstallationHealthSchema = z
     events: z.array(z.string()),
     checkedAt: z.string(),
     errorSummary: z.string().nullable().optional(),
+    // "broker" = a brokered self-host (Orb token broker mode, no local GitHub App private key by design).
+    // Permission/event introspection is unavailable through the broker today, so missingPermissions/missingEvents
+    // are always [] there -- an empty array means "unchecked", not "all satisfied", unlike "local" mode.
+    authMode: z.enum(["local", "broker"]),
     requiredPermissions: z.record(z.string(), z.string()).optional(),
     requiredEvents: z.array(z.string()).optional(),
     optionalVisibleEvents: z.array(z.string()).optional(),

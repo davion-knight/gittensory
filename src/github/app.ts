@@ -3,11 +3,13 @@ import {
   fetchBrokeredInstallationToken,
   isOrbBrokerMode,
 } from "../orb/broker-client";
+import { updateInstallationPermissions } from "../db/repositories";
 import {
   clearGitHubResponseCacheForTest,
   githubRateLimitAdmissionKeyForInstallation,
   makeInstallationOctokit,
   timeoutFetch,
+  type GitHubRateLimitAdmissionKey,
 } from "./client";
 import { maintainerControlPanelUrl } from "./footer";
 import type { AgentActionMode } from "../settings/agent-execution";
@@ -130,10 +132,12 @@ const inFlightMints = new Map<number, Promise<string>>();
 export async function createInstallationToken(
   env: Env,
   installationId: number,
+  options: { forceRefresh?: boolean } = {},
 ): Promise<string> {
   const cached = await readCachedToken(installationId);
-  if (cached && cached.expiresAtMs - TOKEN_SAFETY_MARGIN_MS > Date.now())
+  if (!options.forceRefresh && cached && cached.expiresAtMs - TOKEN_SAFETY_MARGIN_MS > Date.now())
     return cached.token;
+  if (options.forceRefresh) return mintInstallationToken(env, installationId, cached, true);
   const existing = inFlightMints.get(installationId);
   if (existing) return existing; // a concurrent caller is already minting for this install — join it
   const mint = mintInstallationToken(env, installationId, cached).finally(() => {
@@ -156,6 +160,10 @@ export function isGitHubBadCredentialsError(error: unknown): boolean {
   return status === 401 || /bad credentials/i.test(errorMessage(error));
 }
 
+function isGitHubInstallationPermissionError(error: unknown): boolean {
+  return githubErrorStatus(error) === 403 && /resource not accessible by integration|not have permission/i.test(errorMessage(error));
+}
+
 async function expireCachedInstallationToken(
   installationId: number,
   rejectedToken: string,
@@ -174,7 +182,8 @@ export async function withInstallationTokenRetry<T>(
   try {
     return await operation(token);
   } catch (error) {
-    if (!isGitHubBadCredentialsError(error)) throw error;
+    const refreshForPermission = isGitHubInstallationPermissionError(error);
+    if (!isGitHubBadCredentialsError(error) && !refreshForPermission) throw error;
     await expireCachedInstallationToken(installationId, token).catch(
       () => undefined,
     );
@@ -184,10 +193,11 @@ export async function withInstallationTokenRetry<T>(
         event: "github_installation_token_rejected",
         installationId,
         status: githubErrorStatus(error),
+        reason: refreshForPermission ? "permission_scope" : "bad_credentials",
         message: errorMessage(error).slice(0, 200),
       }),
     );
-    const freshToken = await createInstallationToken(env, installationId);
+    const freshToken = await createInstallationToken(env, installationId, { forceRefresh: refreshForPermission });
     return await operation(freshToken);
   }
 }
@@ -214,6 +224,7 @@ async function mintInstallationToken(
   env: Env,
   installationId: number,
   cached: { token: string; expiresAtMs: number } | null,
+  forceRefresh = false,
 ): Promise<string> {
   // Self-host broker mode: a brokered self-host holds no App private key, so source the installation token from
   // the central Orb (enrollment secret → short-lived token) instead of minting locally. Cloud sets no enrollment
@@ -221,11 +232,23 @@ async function mintInstallationToken(
   // self-host's single bound install). See src/orb/broker-client.
   if (isOrbBrokerMode(env)) {
     try {
-      const brokered = await fetchBrokeredInstallationToken(env);
+      const brokered = await fetchBrokeredInstallationToken(env, fetch, { forceRefresh });
       await writeCachedToken(installationId, {
         token: brokered.token,
         expiresAtMs: brokered.expiresAtMs,
       });
+      if (brokered.installationId === installationId && Object.keys(brokered.permissions).length > 0) {
+        await updateInstallationPermissions(env, installationId, brokered.permissions).catch((error) => {
+          console.warn(
+            JSON.stringify({
+              level: "warn",
+              event: "github_installation_permissions_update_failed",
+              installationId,
+              message: errorMessage(error).slice(0, 200),
+            }),
+          );
+        });
+      }
       return brokered.token;
     } catch (error) {
       // Stale-token grace (#2): a brokered self-host holds no App key, so without this a single Orb mint failure
@@ -233,7 +256,7 @@ async function mintInstallationToken(
       // token is STILL within its real expiry, serve it — a valid token beats a stalled review (NO dangerous reuse:
       // an actually-expired token is never served). Otherwise emit an alertable structured log and rethrow so the
       // queue's retry/DLQ handles a genuine outage.
-      if (cached && cached.expiresAtMs > Date.now()) {
+      if (!forceRefresh && cached && cached.expiresAtMs > Date.now()) {
         console.warn(
           JSON.stringify({
             level: "warn",
@@ -430,6 +453,148 @@ export async function getGithubUserCreatedAt(
     return typeof payload.created_at === "string" ? payload.created_at : null;
   } catch {
     return null;
+  }
+}
+
+/** Sentinel result for cancelInFlightWorkflowRunsForHeadSha (#2462) -- mirrors CheckRunOutcome's shape (a
+ *  typed "degraded, not thrown" result) so a missing `actions: write` grant never has to be distinguished
+ *  from a genuine network/API failure by the caller via exception type-narrowing. */
+export type CancelWorkflowRunsOutcome =
+  | { kind: "cancelled"; cancelledCount: number; totalFound: number }
+  | { kind: "permission_missing"; warning: string }
+  | { kind: "error"; warning: string };
+
+// A rate-limit / secondary-limit 403 is NOT a permission gap -- mirrors isCheckRunPermissionError's own
+// exclusion (src/github/app.ts, isRateLimitedError check) so a burst-load 403 is never misrecorded as a
+// permanent actions:write scope gap. Operates on the RAW response body's `message` field (not a thrown
+// Octokit error) since these wrappers use plain timeoutFetch, not an Octokit client.
+function isActionsPermissionMissingMessage(message: string): boolean {
+  if (/secondary rate limit|\babuse\b|api rate limit exceeded|rate limit/i.test(message)) return false;
+  return /resource not accessible by integration|not have permission/i.test(message) || message === "";
+}
+
+async function actionsApiErrorMessage(response: Response): Promise<string> {
+  const body = (await response.json().catch(() => null)) as { message?: unknown } | null;
+  return typeof body?.message === "string" ? body.message : "";
+}
+
+function actionsPermissionMissingResult(message: string): { kind: "permission_missing"; warning: string } {
+  return {
+    kind: "permission_missing",
+    warning: `GitHub App Actions: write permission is missing (${message || "resource not accessible by integration"}). Enable it in the GitHub App settings and re-approve the installation.`,
+  };
+}
+
+type ActionsRunFetchOptions = {
+  headers: HeadersInit;
+  githubRateLimitAdmission: true;
+  githubRateLimitAdmissionKey: GitHubRateLimitAdmissionKey;
+};
+
+// GitHub's default page size (30) means a repo whose head SHA has more than one page of matching runs would
+// silently leave page-2+ runs uncancelled while cancelInFlightWorkflowRunsForHeadSha reports totalFound/
+// cancelledCount as if the listing were complete (gate finding). per_page=100 + follow Link: rel="next" until
+// exhausted; bounded to MAX_WORKFLOW_RUN_LIST_PAGES so a pathological repo can't turn one webhook into an
+// unbounded fetch loop (mirrors src/github/backfill.ts's githubPaginatedList/PR_DETAIL_MAX_PAGES bound).
+const MAX_WORKFLOW_RUN_LIST_PAGES = 10;
+
+function hasNextWorkflowRunPage(link: string | null): boolean {
+  return Boolean(link?.split(",").some((part) => /rel="next"/.test(part)));
+}
+
+// Split out of cancelInFlightWorkflowRunsForHeadSha (a named function, not an inline for-of body) so v8's
+// per-branch coverage tracking attributes hits correctly across repeated loop iterations with early returns
+// -- an inline loop body with early `return`s inside a `for` inside an `async function` can under-report the
+// "condition false" side of a branch even when it demonstrably executes (confirmed via a live debug trace).
+async function listWorkflowRunIdsForStatus(
+  repoPath: string,
+  headSha: string,
+  status: "in_progress" | "queued",
+  fetchOptions: ActionsRunFetchOptions,
+): Promise<{ kind: "ids"; ids: number[] } | { kind: "permission_missing"; warning: string } | { kind: "error"; warning: string }> {
+  const ids: number[] = [];
+  for (let page = 1; page <= MAX_WORKFLOW_RUN_LIST_PAGES; page += 1) {
+    const response = await timeoutFetch(
+      `https://api.github.com/repos/${repoPath}/actions/runs?head_sha=${encodeURIComponent(headSha)}&status=${status}&per_page=100&page=${page}`,
+      fetchOptions,
+    );
+    if (!response.ok) {
+      const message = await actionsApiErrorMessage(response);
+      if (response.status === 403 && isActionsPermissionMissingMessage(message)) {
+        return actionsPermissionMissingResult(message);
+      }
+      return { kind: "error", warning: `Failed to list workflow runs (${response.status}): ${message || "unknown error"}` };
+    }
+    const payload = (await response.json()) as { workflow_runs?: Array<{ id: number }> };
+    ids.push(...(payload.workflow_runs ?? []).map((run) => run.id));
+    if (!hasNextWorkflowRunPage(response.headers.get("link"))) break;
+  }
+  return { kind: "ids", ids };
+}
+
+// Same extraction rationale as listWorkflowRunIdsForStatus above. Mirrors that function's error shape (#gate
+// finding): a non-403 (or a 403 that isn't actually a permission gap -- rate limits, abuse detection) is a
+// genuine `error`, carrying the real status + message, not a bare untyped "not a permission problem" with
+// nothing for the caller to log or surface -- the prior shape let the caller's loop silently drop a 500/404/422
+// on the floor instead of ever reaching an `error` branch at all.
+async function cancelOneWorkflowRun(
+  repoPath: string,
+  runId: number,
+  fetchOptions: ActionsRunFetchOptions,
+): Promise<{ kind: "cancelled" } | { kind: "permission_missing"; warning: string } | { kind: "error"; warning: string }> {
+  const response = await timeoutFetch(`https://api.github.com/repos/${repoPath}/actions/runs/${runId}/cancel`, { ...fetchOptions, method: "POST" });
+  // 202 = cancellation accepted; 409 = already completed/cancelling -- both are non-failures here (the run is
+  // no longer going to keep burning minutes either way). Only a genuine 403 signals a scope gap.
+  if (response.ok || response.status === 409) return { kind: "cancelled" };
+  const message = await actionsApiErrorMessage(response);
+  if (response.status === 403 && isActionsPermissionMissingMessage(message)) {
+    return actionsPermissionMissingResult(message);
+  }
+  return { kind: "error", warning: `Failed to cancel workflow run ${runId} (${response.status}): ${message || "unknown error"}` };
+}
+
+/** List then cancel every in-progress/queued Actions run at a PR's head SHA (#2462): a PR auto-closed for
+ *  exceeding the per-contributor open-item cap should also stop burning CI minutes on its in-flight runs.
+ *  Needs `actions: write` (list needs `actions: read`, effectively granted alongside write) -- an
+ *  installation that hasn't granted it gets a typed `permission_missing` result, never a thrown error, so
+ *  this can run as a best-effort side effect AFTER a close has already succeeded without risking that
+ *  success being misrecorded as a failure. Greenfield: no existing Actions-API wrapper to extend. */
+export async function cancelInFlightWorkflowRunsForHeadSha(
+  env: Env,
+  installationId: number,
+  repoFullName: string,
+  headSha: string,
+): Promise<CancelWorkflowRunsOutcome> {
+  const [owner, repo] = repoFullName.split("/");
+  if (!owner || !repo) return { kind: "error", warning: `Invalid repository full name: ${repoFullName}` };
+  const repoPath = `${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  try {
+    const token = await createInstallationToken(env, installationId);
+    const fetchOptions: ActionsRunFetchOptions = {
+      headers: githubHeaders(`Bearer ${token}`),
+      githubRateLimitAdmission: true,
+      githubRateLimitAdmissionKey: githubRateLimitAdmissionKeyForInstallation(installationId),
+    };
+    const runIds = new Set<number>();
+    for (const status of ["in_progress", "queued"] as const) {
+      const listed = await listWorkflowRunIdsForStatus(repoPath, headSha, status, fetchOptions);
+      if (listed.kind !== "ids") return listed;
+      for (const id of listed.ids) runIds.add(id);
+    }
+    if (runIds.size === 0) return { kind: "cancelled", cancelledCount: 0, totalFound: 0 };
+    let cancelledCount = 0;
+    for (const runId of runIds) {
+      const result = await cancelOneWorkflowRun(repoPath, runId, fetchOptions);
+      // #gate finding: ANY non-cancelled result (permission_missing OR a genuine error) must stop and surface
+      // immediately, exactly like listWorkflowRunIdsForStatus's own `listed.kind !== "ids"` check above --
+      // silently `continue`-ing past a real 500/404/422 let the final return still claim `kind: "cancelled"`
+      // with an undercounted cancelledCount, auditing a partial failure as a clean success.
+      if (result.kind === "cancelled") cancelledCount += 1;
+      else return result;
+    }
+    return { kind: "cancelled", cancelledCount, totalFound: runIds.size };
+  } catch (error) {
+    return { kind: "error", warning: error instanceof Error ? error.message : "unknown error" };
   }
 }
 

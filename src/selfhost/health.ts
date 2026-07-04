@@ -113,6 +113,63 @@ export function githubAppReadinessProbe(
   };
 }
 
+/** Readiness probe for the codex CLI auth (#GITTENSORY-C). Runs `codex --version` in the restricted codex
+ *  environment to confirm the binary is present AND authenticated before any review is attempted. A missing auth
+ *  volume or an unauthenticated CLI exits non-zero here rather than silently inside a subprocess spawned mid-review.
+ *  Only registered when `GITTENSORY_ENABLE_UNSAFE_CODEX_REVIEWER=1` (the opt-in for the codex reviewer path). */
+/** `codex --version` only proves the binary starts — it exits 0 with no usable credentials at all, so on its
+ *  own it can't catch the exact missing/empty-auth-volume misconfiguration this probe exists to surface.
+ *  Also stat the auth file so a present-but-empty or altogether-missing auth.json still fails readiness. */
+async function defaultCodexAuthFileCheck(env: Record<string, string | undefined>): Promise<boolean> {
+  const { stat } = await import("node:fs/promises");
+  const base = env.CODEX_HOME ?? `${env.HOME ?? "~"}/.codex`;
+  try {
+    const info = await stat(`${base}/auth.json`);
+    return info.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+export function codexAuthReadinessProbe(
+  parentEnv: Record<string, string | undefined>,
+  runCodexVersion: (env: Record<string, string | undefined>) => Promise<{ code: number | null }>,
+  checkAuthFile: (env: Record<string, string | undefined>) => Promise<boolean> = defaultCodexAuthFileCheck,
+  cacheMs = 30_000,
+): ReadinessProbe | null {
+  if (parentEnv.GITTENSORY_ENABLE_UNSAFE_CODEX_REVIEWER !== "1") return null;
+  let cached: boolean | undefined;
+  let cachedUntil = 0;
+  let inFlight: Promise<boolean> | undefined;
+  const evaluate = async (): Promise<boolean> => {
+    const [versionOk, authFileOk] = await Promise.all([
+      runCodexVersion(parentEnv)
+        .then(({ code }) => code === 0)
+        .catch(() => false),
+      checkAuthFile(parentEnv).catch(() => false),
+    ]);
+    return versionOk && authFileOk;
+  };
+  return {
+    name: "codex_auth",
+    check: () => {
+      const now = Date.now();
+      if (cached !== undefined && now < cachedUntil) return Promise.resolve(cached);
+      if (inFlight) return inFlight;
+      inFlight = evaluate()
+        .then((ok) => {
+          cached = ok;
+          cachedUntil = Date.now() + cacheMs;
+          return ok;
+        })
+        .finally(() => {
+          inFlight = undefined;
+        });
+      return inFlight;
+    },
+  };
+}
+
 /** Boot-time DATA-SAFETY advisory. A single SQLite file with no acknowledged backup is a data-loss SPOF — yet
  *  `/ready` would still answer 200, so an operator can run with zero durability believing they're healthy. Returns
  *  the warning to log at boot (or null on Postgres, or once the operator sets `BACKUP_ACKNOWLEDGED=true` after

@@ -24,6 +24,7 @@ import {
   resolveRequiredCliProviders,
   resolveSubscriptionCliPath,
   shouldMarkAiProviderUnhealthyAtBoot,
+  subscriptionCliEnv,
 } from "./selfhost/ai";
 import {
   cookieValue,
@@ -37,11 +38,12 @@ import {
   setupTokenFormRejection,
   timingSafeStrEqual,
 } from "./selfhost/setup-wizard";
-import { isOrbBrokerMode, registerOrbRelayTarget } from "./orb/broker-client";
+import { createOrbRelayRegistrationState, isOrbBrokerMode, registerOrbRelayTargetWithRetry } from "./orb/broker-client";
 import { exportOrbBatch } from "./selfhost/orb-collector";
 import { createD1Adapter, nodeSqliteDriver } from "./selfhost/d1-adapter";
 import {
   buildHealthBody,
+  codexAuthReadinessProbe,
   githubAppReadinessProbe,
   readiness,
   resolveHealthVersion,
@@ -53,7 +55,8 @@ import { runSelfHostMigrations } from "./selfhost/migrate";
 import { createPgAdapter, tuneGithubRateLimitObservationsAutovacuum } from "./selfhost/pg-adapter";
 import { createPgQueue } from "./selfhost/pg-queue";
 import { createPgVectorize, initPgVectorize } from "./selfhost/pg-vectorize";
-import { resolvePostgresPoolMax } from "./selfhost/queue-common";
+import { resolvePostgresPoolMax, type SelfHostQueueSnapshot } from "./selfhost/queue-common";
+import type { MaintenancePressureSignals } from "./selfhost/maintenance-admission";
 import { createSqliteQueue } from "./selfhost/sqlite-queue";
 import { createSqliteVectorize } from "./selfhost/vectorize";
 import { createFsBlobStore } from "./selfhost/blob-store";
@@ -71,6 +74,7 @@ import {
 } from "./selfhost/sentry";
 import {
   drainOrbRelayWithMonitor,
+  registerOrbRelayWithMonitor,
   runOrbExportWithMonitor,
   runScheduledLoopWithMonitor,
 } from "./selfhost/monitored-work";
@@ -92,6 +96,7 @@ import {
   setLocalManifestReader,
   setLocalReviewContextReader,
 } from "./signals/focus-manifest-loader";
+import { probeReesSecretAtStartup } from "./review/enrichment-wire";
 import type { JobMessage } from "./types";
 
 /** Resolve `<NAME>_FILE` env vars (Docker secrets / multi-line keys) into `<NAME>` at startup. */
@@ -125,7 +130,10 @@ interface Backend {
     stop(): Promise<void>;
     size(): number | Promise<number>;
     deadCount(): number | Promise<number>;
+    processingCount(): number | Promise<number>;
     stats(): Record<string, number> | Promise<Record<string, number>>;
+    pressureSignals(): MaintenancePressureSignals | Promise<MaintenancePressureSignals>;
+    snapshot(): SelfHostQueueSnapshot | Promise<SelfHostQueueSnapshot>;
   };
   vectorize?: Vectorize;
   shutdown(): Promise<void>;
@@ -266,8 +274,9 @@ async function main(): Promise<void> {
   /* v8 ignore next -- importing this entrypoint starts the Node server; pure validation is covered in selfhost-preflight tests. */
   assertSelfHostPreflight(process.env);
   // Container-private per-repo config (self-host): register the GITTENSORY_REPO_CONFIG_DIR reader so the focus-
-  // manifest loader prefers a mounted `{owner}__{repo}.yml` over the public `.gittensory.yml` (review policy stays
-  // private). Unset dir ⇒ null reader ⇒ unchanged public-fetch behavior.
+  // manifest loader prefers a mounted `{owner}__{repo}.yml`, deep-merged over an optional root `.gittensory.yml`
+  // global default, over the public `.gittensory.yml` (review policy stays private; see
+  // config/examples/README.md). Unset dir ⇒ null reader ⇒ unchanged public-fetch behavior.
   setLocalManifestReader(
     makeLocalManifestReader(process.env.GITTENSORY_REPO_CONFIG_DIR),
   );
@@ -571,8 +580,32 @@ async function main(): Promise<void> {
     });
   }
 
+  // Codex auth probe (#GITTENSORY-C): verify the codex CLI is authenticated at boot so a missing or
+  // unauthenticated auth volume surfaces in /ready instead of silently inside a spawned subprocess mid-review.
+  const codexProbe = codexAuthReadinessProbe(process.env, async (env) => {
+    const { spawn } = await import("node:child_process");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    return new Promise<{ code: number | null }>((resolve) => {
+      const child = spawn("codex", ["--version"], {
+        env: subscriptionCliEnv(env) as NodeJS.ProcessEnv,
+        signal: controller.signal,
+        stdio: "ignore",
+      });
+      child.on("close", (code) => resolve({ code }));
+      child.on("error", () => resolve({ code: 1 }));
+    }).finally(() => clearTimeout(timeout));
+  });
+  if (codexProbe) {
+    readinessProbes.push({
+      name: codexProbe.name,
+      check: () => withTimeout(codexProbe.check()),
+    });
+  }
+
   gauge("gittensory_queue_pending", () => backend.queue.size());
   gauge("gittensory_queue_dead", () => backend.queue.deadCount());
+  gauge("gittensory_queue_processing", () => backend.queue.processingCount());
   const durableJobMetric = async (name: string): Promise<number> =>
     Number((await backend.queue.stats())[name] ?? 0);
   for (const name of [
@@ -584,11 +617,40 @@ async function main(): Promise<void> {
     "gittensory_jobs_rate_limit_deferred_total",
     "gittensory_jobs_coalesced_total",
     "gittensory_jobs_recovered_total",
+    "gittensory_jobs_maintenance_admission_deferred_total",
+    "gittensory_jobs_maintenance_trickle_admitted_total",
   ]) {
     gauge(name.replace("_total", "_persisted_total"), () =>
       durableJobMetric(name),
     );
   }
+  // Runtime-pressure gauges (#selfhost-runtime-pressure): the SAME signals the maintenance-admission policy
+  // consults at claim time (see maintenance-admission.ts), so the dashboard shows exactly what's gating
+  // maintenance work right now -- live vs. maintenance queue depth, how stale the oldest of each is, and
+  // (best-effort) host CPU pressure. Distinguishes "the app queue is backed up" from "CI/other host load is
+  // starving the app" from "GitHub/AI latency", the ambiguity that made the original slowdown hard to diagnose.
+  const maintenancePressure = () => backend.queue.pressureSignals();
+  gauge("gittensory_queue_live_pending", async () => (await maintenancePressure()).livePendingCount);
+  gauge("gittensory_queue_maintenance_pending", async () => (await maintenancePressure()).maintenancePendingCount);
+  gauge("gittensory_queue_oldest_live_pending_age_seconds", async () =>
+    Math.floor(((await maintenancePressure()).oldestLivePendingAgeMs ?? 0) / 1000),
+  );
+  gauge("gittensory_queue_oldest_maintenance_pending_age_seconds", async () =>
+    Math.floor(((await maintenancePressure()).oldestMaintenancePendingAgeMs ?? 0) / 1000),
+  );
+  // #selfhost-queue-liveness: runnable-now is the "is anything actually due right now" signal the incident
+  // this module fixes required manual SQL to answer (processing=0, runnable_now=0 with hundreds pending).
+  // gittensory_queue_runnable_now covers every priority; the live-scoped pair narrows to foreground work
+  // specifically and adds the oldest-RUNNABLE age, distinct from oldest-PENDING age (which a job intentionally
+  // scheduled far out can inflate without indicating anything is stuck).
+  gauge("gittensory_queue_runnable_now", async () => (await backend.queue.snapshot()).totals.due);
+  gauge("gittensory_queue_live_runnable_now", async () => (await maintenancePressure()).liveRunnableNowCount);
+  gauge("gittensory_queue_oldest_live_runnable_age_seconds", async () =>
+    Math.floor(((await maintenancePressure()).oldestLiveRunnableAgeMs ?? 0) / 1000),
+  );
+  // -1 (not 0) when unavailable -- a genuine idle host reads 0, so a dashboard can tell "known idle" apart
+  // from "no signal on this platform" (see host-pressure.ts).
+  gauge("gittensory_host_load_avg1_per_core", async () => (await maintenancePressure()).hostLoadAvg1PerCore ?? -1);
   gauge("gittensory_uptime_seconds", () =>
     Math.floor((Date.now() - startedAt) / 1000),
   );
@@ -809,7 +871,12 @@ async function main(): Promise<void> {
       },
       port,
     },
-    () => console.log(JSON.stringify({ event: "selfhost_listening", port })),
+    () => {
+      console.log(JSON.stringify({ event: "selfhost_listening", port }));
+      // Probe REES shared secret at startup so mismatches appear in logs/Sentry before
+      // any PR triggers a review (fire-and-forget; never blocks server startup).
+      probeReesSecretAtStartup(env);
+    },
   );
 
   backend.queue.start();
@@ -854,35 +921,30 @@ async function main(): Promise<void> {
   setInterval(runOrbExport, 3_600_000); // then hourly
   /* v8 ignore stop */
 
-  // Brokered self-host: register our relay target with the central Orb (best-effort, fire-and-forget). PUSH mode
-  // (default) registers a public relay URL the Orb POSTs to; PULL mode (ORB_RELAY_MODE=pull) registers no URL and
-  // the drain loop below pulls events outbound — the right fit behind NAT/tailnet (no inbound endpoint exposed).
-  void registerOrbRelayTarget({
+  // Brokered self-host: register our relay target with the central Orb (best-effort). PUSH mode (default)
+  // registers a public relay URL the Orb POSTs to; PULL mode (ORB_RELAY_MODE=pull) registers no URL and the
+  // drain loop below pulls events outbound — the right fit behind NAT/tailnet (no inbound endpoint exposed).
+  // A bare one-shot boot-time attempt never recovers from a transient broker outage without a restart
+  // (#selfhost-runtime-drift), so this now RETRIES on a timer: registerOrbRelayWithMonitor no-ops once
+  // registered and otherwise backs off to at most one attempt per ORB_RELAY_REGISTER_RETRY_BACKOFF_MS.
+  /* v8 ignore start -- self-host entrypoint timer; the retry/backoff logic itself is unit-tested in
+   * orb-broker-client.test.ts and selfhost-monitored-work.test.ts. */
+  const orbRelayEnv = {
     ORB_ENROLLMENT_SECRET: process.env.ORB_ENROLLMENT_SECRET,
     ORB_BROKER_URL: process.env.ORB_BROKER_URL,
     PUBLIC_API_ORIGIN: process.env.PUBLIC_API_ORIGIN,
     ORB_RELAY_MODE: process.env.ORB_RELAY_MODE,
-  })
-    .then((r) => {
-      if (r.status === "registered") {
-        console.log(JSON.stringify({ event: "selfhost_orb_relay_register", result: r.status }));
-      } else if (r.status === "failed") {
-        // A failed registration is fatal for PUSH mode (the Orb can't reach our public relay URL → the container
-        // looks alive but reviews NOTHING → error). In PULL mode the outbound drain loop below delivers events
-        // regardless, so a failed announce is only degraded telemetry → warn (not paged as a deaf container).
-        // Either way carry the reason (HTTP status / fetch error) in `error` so Sentry shows WHY, not "(no message)".
-        const pull = process.env.ORB_RELAY_MODE === "pull";
-        console.error(
-          JSON.stringify({
-            level: pull ? "warn" : "error",
-            event: "selfhost_orb_relay_register_failed",
-            mode: pull ? "pull" : "push",
-            error: r.reason ?? "unknown",
-          }),
-        );
-      }
-    })
-    .catch((error) => captureError(error, { kind: "orb_relay_register" }));
+  };
+  const orbRelayRegistrationState = createOrbRelayRegistrationState();
+  const attemptOrbRelayRegistration = (): Promise<void> =>
+    registerOrbRelayWithMonitor({
+      env: orbRelayEnv,
+      state: orbRelayRegistrationState,
+      register: registerOrbRelayTargetWithRetry,
+    }).catch((error) => captureError(error, { kind: "orb_relay_register" }));
+  void attemptOrbRelayRegistration();
+  setInterval(() => void attemptOrbRelayRegistration(), 60_000);
+  /* v8 ignore stop */
 
   // Pull-mode relay drain (#secure-relay): when ORB_RELAY_MODE=pull, the engine DRAINS its events from the Orb on a
   // timer instead of exposing an inbound endpoint — the right fit behind NAT/tailnet. Acks the previous batch so the

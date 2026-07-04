@@ -263,6 +263,34 @@ function codexCliEnv(parent: Record<string, string | undefined>): Record<string,
   return child;
 }
 
+/** Resolve the path to codex's auth file so we can preflight it before spawning the subprocess.
+ *  Codex stores credentials at `$CODEX_HOME/auth.json` when CODEX_HOME is set, otherwise
+ *  `$HOME/.codex/auth.json`. The Docker setup symlinks /home/node/.codex → /data/codex, so this
+ *  path is only populated after the operator runs `codex auth` at runtime. */
+export function resolveCodexAuthPath(env: Record<string, string | undefined>): string {
+  // Use the sync path.join from the already-imported "node:path" delimiter import above.
+  // We only need `join` here, which we can reconstruct simply to avoid a dynamic import in a sync helper.
+  const sep = "/";
+  const base = env.CODEX_HOME ?? `${env.HOME ?? "~"}${sep}.codex`;
+  return `${base}${sep}auth.json`;
+}
+
+/** Throws `codex_auth_not_configured` if codex's auth.json does not exist or is unreadable.
+ *  Called before spawning the codex subprocess so the error message is immediately actionable
+ *  ("run `codex auth`") rather than the cryptic `codex_exit_1: Reading prompt from stdin...`
+ *  that surfaces when the CLI silently fails without credentials. */
+async function assertCodexAuthConfigured(env: Record<string, string | undefined>): Promise<void> {
+  const { access, constants } = await import("node:fs/promises");
+  const authPath = resolveCodexAuthPath(env);
+  try {
+    await access(authPath, constants.R_OK);
+  } catch {
+    throw new Error(
+      `codex_auth_not_configured: ${authPath} not found or unreadable — run \`codex auth\` to authenticate, then restart the container`,
+    );
+  }
+}
+
 async function isolatedCliCwd(): Promise<string> {
   const { mkdtemp } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
@@ -403,11 +431,37 @@ export function claudeErrorStatus(stdout: string): string | null {
   return null;
 }
 
+/** Extract a diagnostic error string from Codex's JSONL stdout on a non-zero exit. Codex writes its actual
+ *  error (auth failure, unknown model, API error) into the JSON stream rather than stderr — stderr typically
+ *  contains only the startup status "Reading prompt from stdin..." which is uninformative. Scans lines in
+ *  reverse (the error object is usually last) and returns the first human-readable detail found, or null. */
+export function codexErrorFromStdout(stdout: string): string | null {
+  const lines = stdout.trim().split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line?.trim()) continue;
+    try {
+      const o = JSON.parse(line) as Record<string, unknown>;
+      const errorObj = o.error as Record<string, unknown> | undefined;
+      const detail =
+        (typeof o.error === "string" && o.error) ||
+        (typeof o.message === "string" && o.message) ||
+        (typeof o.msg === "string" && o.msg) ||
+        (errorObj && typeof errorObj.message === "string" ? errorObj.message : null) ||
+        null;
+      if (detail) return detail.slice(0, 500);
+    } catch {
+      /* not JSON — skip */
+    }
+  }
+  return null;
+}
+
 type SpawnFn = (
   cmd: string,
   args: string[],
   opts: { env: Record<string, string | undefined>; input?: string; timeoutMs: number; cwd?: string },
-) => Promise<{ stdout: string; code: number | null; stderr?: string }>;
+) => Promise<{ stdout: string; code: number | null; stderr?: string; timedOut?: boolean }>;
 
 async function defaultSpawn(): Promise<SpawnFn> {
   const cp = await import("node:child_process");
@@ -422,7 +476,9 @@ async function defaultSpawn(): Promise<SpawnFn> {
       /* v8 ignore start */ // a 120s subprocess timeout is not unit-testable without a 2-minute wait
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
-        reject(new Error("subscription_cli_timeout"));
+        // Resolve (not reject) so callers receive whatever stdout/stderr was accumulated before the kill —
+        // that partial output may contain the real error detail (e.g. codex JSONL error lines).
+        resolve({ stdout, code: null, stderr, timedOut: true });
       }, o.timeoutMs);
       /* v8 ignore stop */
       child.stdout?.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
@@ -512,12 +568,13 @@ export function createClaudeCodeAi(parentEnv: Record<string, string | undefined>
         const prompt = toMessages(options).map((m) => m.content).join("\n\n");
         const spawn = spawnImpl ?? (await defaultSpawn());
         attempted = true;
-        const { stdout, code, stderr } = await spawn(
+        const { stdout, code, stderr, timedOut } = await spawn(
           "claude",
           ["--print", "--output-format", "json", "--model", claudeModel, "--permission-mode", "plan", "--effort", effort, "--disallowedTools", "Bash,Edit,Write,WebFetch,WebSearch"],
           { env, input: prompt, timeoutMs, cwd: await isolatedCliCwd() },
         );
         stdoutForMetrics = stdout;
+        if (timedOut) throw new Error("subscription_cli_timeout");
         // Surface the STRUCTURED error envelope FIRST. `claude --output-format json` reports API/auth/model errors in its
         // stdout JSON ({is_error,api_error_status}) on a NON-ZERO exit too — e.g. an unknown model exits 1 with the 404
         // envelope in stdout and EMPTY stderr. Checking it before the exit code turns an opaque `claude_code_exit_1: `
@@ -541,7 +598,11 @@ export function createClaudeCodeAi(parentEnv: Record<string, string | undefined>
 
 /** Codex subscription (`codex exec`). Fail closed by default: Codex OAuth homes are readable by prompt-influenced
  *  review sandboxes unless an operator explicitly opts into that risk for an isolated deployment. */
-export function createCodexAi(parentEnv: Record<string, string | undefined>, spawnImpl?: SpawnFn): SelfHostAi {
+export function createCodexAi(
+  parentEnv: Record<string, string | undefined>,
+  spawnImpl?: SpawnFn,
+  authCheckImpl: (env: Record<string, string | undefined>) => Promise<void> = assertCodexAuthConfigured,
+): SelfHostAi {
   return {
     async run(model, options) {
       // Codex is chat-only here — reject embed requests so the chain routes them to an embed-capable provider.
@@ -556,6 +617,7 @@ export function createCodexAi(parentEnv: Record<string, string | undefined>, spa
       let stdoutForMetrics = "";
       try {
         assertCodexCredentialIsolation(parentEnv);
+        await authCheckImpl(parentEnv);
         const env = codexCliEnv(parentEnv);
         const prompt = toMessages(options).map((m) => m.content).join("\n\n");
         const spawn = spawnImpl ?? (await defaultSpawn());
@@ -563,7 +625,7 @@ export function createCodexAi(parentEnv: Record<string, string | undefined>, spa
         if (codexModel) args.push("--model", codexModel);
         args.push("-c", `model_reasoning_effort="${effort}"`);
         attempted = true;
-        const { stdout, code, stderr } = await spawn("codex", args, {
+        const { stdout, code, stderr, timedOut } = await spawn("codex", args, {
           env,
           // `codex exec` reads stdin when no prompt argv is provided; keep PR prompts/diffs out of process listings.
           input: prompt,
@@ -571,7 +633,27 @@ export function createCodexAi(parentEnv: Record<string, string | undefined>, spa
           cwd: await isolatedCliCwd(),
         });
         stdoutForMetrics = stdout;
-        if (code !== 0) throw new Error(`codex_exit_${code ?? "null"}: ${redactSecrets(stderr ?? "").slice(0, 500)}`);
+        if (timedOut) {
+          // Include whatever the JSONL stream captured before the kill — codex writes errors there, not to stderr.
+          const detail = codexErrorFromStdout(stdout) ?? (redactSecrets(stderr ?? "").slice(0, 200) || "no output");
+          throw new Error(`codex_timeout: ${detail}`);
+        }
+        if (code !== 0) {
+          const stderrTrimmed = (stderr ?? "").trim();
+          const jsonlDetail = codexErrorFromStdout(stdout);
+          if (!jsonlDetail && stderrTrimmed === "Reading prompt from stdin...") {
+            // codex's JSONL stream carried no structured detail and stderr is ONLY the stdin-reading banner (no
+            // API/auth error appended) — auth.json was present at boot-time but is now expired or was deleted.
+            // Surface a distinct error so Sentry groups it separately from genuine API failures (rate limits,
+            // model errors, network issues).
+            throw new Error("codex_no_auth: auth.json missing or expired — re-run `codex auth` and restart");
+          }
+          // Prefer the structured error from codex's JSONL stdout over the uninformative stderr startup message
+          // ("Reading prompt from stdin..."). Codex reports auth/model/API failures in its JSON stream; stderr
+          // at exit time usually only contains that startup status line and nothing actionable.
+          const detail = jsonlDetail ?? redactSecrets(stderrTrimmed).slice(0, 500);
+          throw new Error(`codex_exit_${code}: ${detail}`);
+        }
         const text = extractCliText(stdout);
         if (!text) throw new Error("codex_empty_output");
         return { response: text };
@@ -612,6 +694,7 @@ export function resetAiProviderHealthForTest(): void {
 const AI_PROVIDER_FAILURE_THRESHOLD = 3;
 const AI_PROVIDER_COOLDOWN_MS = 60_000;
 const aiProviderCircuits = new Map<string, { failures: number; cooldownUntil: number }>();
+const EXPECTED_EMBEDDING_ROUTING_ERRORS = new Set(["claude_code_no_embed", "codex_no_embed"]);
 
 /** Test-only reset so circuit state from one test can't leak into the next (module-level map). */
 export function resetAiProviderCircuitBreakerForTest(): void {
@@ -688,6 +771,10 @@ function requestKind(options: AiRunOptions): "embedding" | "review" {
   return Array.isArray(options.text) ? "embedding" : "review";
 }
 
+function isExpectedEmbeddingRoutingError(options: AiRunOptions, error: unknown): boolean {
+  return requestKind(options) === "embedding" && EXPECTED_EMBEDDING_ROUTING_ERRORS.has(errorMessage(error));
+}
+
 async function runProviderWithOtel(
   provider: { name: string; ai: SelfHostAi },
   model: string,
@@ -709,6 +796,7 @@ async function runProviderWithOtel(
     aiProviderCircuits.delete(provider.name);
     return result;
   } catch (error) {
+    if (isExpectedEmbeddingRoutingError(options, error)) throw error;
     incr("gittensory_ai_provider_failures_total", { provider: provider.name });
     // Re-read the map here rather than reusing the `circuit` captured above: that read happened BEFORE the
     // `await` on the real provider call, so under concurrent same-provider calls it can be stale by the time

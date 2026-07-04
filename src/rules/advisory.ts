@@ -11,9 +11,11 @@ import type {
 } from "../types";
 import type { CollisionCluster, CollisionReport } from "../signals/engine";
 import { isDuplicateClusterWinnerByClaim } from "../signals/duplicate-winner";
+import { isCodeFile } from "../signals/local-branch";
 import { isTestPath } from "../signals/test-evidence";
 import { nowIso } from "../utils/json";
 import { GITTENSORY_GATE_CHECK_NAME } from "../review/check-names";
+import { CLA_CHECK_UNRESOLVED_CODE, CLA_CONSENT_MISSING_CODE } from "../review/cla-check";
 import { REVIEW_THREAD_BLOCKER_CODE } from "../review/review-thread-findings";
 import { labelMatchesPattern } from "../scoring/preview";
 
@@ -52,6 +54,11 @@ export type GateCheckPolicy = {
    *  the PR author also filed the linked issue — becomes a hard blocker. Defaults to `advisory` — the
    *  finding is surfaced but never blocks unless the maintainer opts in. */
   selfAuthoredLinkedIssueGateMode?: GateRuleMode | undefined;
+  /** CLA / license-compatibility gate (#2564). When `block`, a `cla_consent_missing` finding — raised when
+   *  neither configured detection method (a consent phrase in the PR body, or a named CLA-bot check-run
+   *  conclusion) confirms consent — becomes a hard blocker. `off` (default) = no finding at all; `advisory` =
+   *  the finding surfaces but never blocks. Independent of every other gate dimension, like manifestPolicy. */
+  claGateMode?: GateRuleMode | undefined;
   /** First-time-contributor grace (#552). RESERVED / currently INERT (#2266): threaded through from config,
    *  but evaluateGateCheckCore never reads it (see the removal note below) — a would-be blocker gates a
    *  genuine newcomer exactly like a repeat contributor. Kept for potential future use. */
@@ -72,6 +79,11 @@ export type GateCheckPolicy = {
    *  neutral gate → "manual" verdict, never auto-merged and never a hard failure. Defaults off; thresholds default
    *  to 10 files / 1000 lines. This is a HOLD (advisory dry-run friendly), not a close. */
   sizeGateMode?: GateRuleMode | undefined;
+  /** Lockfile-tamper-risk gate (#2563). When `block`, a `lockfile_tamper_risk` finding (produced by
+   *  review/lockfile-tamper.ts when a changed package-lock.json's resolved/integrity value changed without a
+   *  matching package.json version bump, or points off the npm registry) becomes a hard blocker. Defaults to
+   *  `off` — the finding is never produced when off, and never blocks under `advisory`. */
+  lockfileIntegrityGateMode?: GateRuleMode | undefined;
   /** Aggregate change size, threaded from the resolved file list (changedLineCount = additions + deletions). */
   changedFileCount?: number | null | undefined;
   changedLineCount?: number | null | undefined;
@@ -343,7 +355,12 @@ export function buildCheckRunAnnotations(
   };
 
   const annotatableFiles = annotatablePullRequestFiles(annotationContext.files);
-  const codeFiles = annotatableFiles.filter((file) => !isTestPath(file.path));
+  // "Code" for the missing-test signal is GENUINE source (isCodeFile), not merely "anything that isn't a test":
+  // annotatableFiles is gated by isCodePath, which admits docs/config/data (.md/.yaml/.yml/.json/.toml), so a
+  // docs-, config-, or manifest-only PR would otherwise be flagged "Missing test evidence" for changing files
+  // that have nothing to cover. Mirrors the isCodeFile source predicate #2722 aligned the missing_tests check to
+  // (contributor-open-pr-monitor.ts) and slop.ts's buildMissingTestEvidenceFinding.
+  const codeFiles = annotatableFiles.filter((file) => isCodeFile(file.path));
   const testFiles = annotatableFiles.filter((file) => isTestPath(file.path));
   if (codeFiles.length > 0 && testFiles.length === 0) {
     for (const file of codeFiles) {
@@ -500,7 +517,7 @@ function evaluateGateCheckCore(advisoryResult: Advisory, policy: GateCheckPolicy
   // App/infra state (repo not synced yet, PR not cached): gittensory cannot evaluate this PR yet, so the
   // gate is NEUTRAL (non-blocking) and re-evaluates automatically on the next sync/webhook. Never block a
   // contributor on the app's OWN state.
-  if (advisoryResult.findings.some((finding) => isEvaluationBlocker(finding.code))) {
+  if (advisoryResult.findings.some((finding) => isEvaluationBlocker(finding.code, policy))) {
     return {
       enabled: true,
       conclusion: "neutral",
@@ -827,11 +844,19 @@ function conclusionForSeverity(severity: AdvisorySeverity, findings: AdvisoryFin
   return "success";
 }
 
-function isEvaluationBlocker(code: string): boolean {
+function isEvaluationBlocker(code: string, policy: GateCheckPolicy): boolean {
   // pre_merge_check_unresolved: an enforced path-gated pre-merge check whose changed-file set could not be
   // resolved — gittensory cannot evaluate it yet, so the gate is NEUTRAL (held) and re-evaluates on the next
   // sync, rather than auto-merging past the unverified requirement or hard-closing on a transient miss. (#review-audit)
-  return code === "repo_not_registered" || code === "repo_not_seen" || code === "pr_not_cached" || code === "pre_merge_check_unresolved";
+  if (code === "repo_not_registered" || code === "repo_not_seen" || code === "pr_not_cached" || code === "pre_merge_check_unresolved") return true;
+  // cla_check_unresolved (#2564): the CLA-bot check-run's conclusion could not be resolved. Unlike the codes
+  // above (which are never mode-gated), evaluateClaCheck runs for BOTH claGateMode "advisory" and "block" (so
+  // the finding surfaces either way) — only "block" should ever HOLD the gate on an unresolved check-run.
+  // "advisory" mode's whole contract is "surface findings, never affect the verdict"; unconditionally holding
+  // here would violate that for any advisory-mode repo using check-run-only detection (#2564 gate-review
+  // finding). advisory mode still gets the finding in the panel via the normal warnings path below.
+  if (code === CLA_CHECK_UNRESOLVED_CODE) return policy.claGateMode === "block";
+  return false;
 }
 
 // Default configured close-confidence floor (#7) retained for settings compatibility and public calibration text.
@@ -874,6 +899,13 @@ function isConfiguredGateBlocker(finding: AdvisoryFinding, policy: GateCheckPoli
   // Self-authored linked-issue gate: blocks only when the maintainer opts in with `block`. Defaults to
   // advisory — the finding surfaces in the panel without ever closing the PR unless explicitly configured.
   if (code === "self_authored_linked_issue") return gateMode(policy.selfAuthoredLinkedIssueGateMode ?? "advisory") === "block";
+  // Lockfile-tamper-risk gate (#2563): blocks only when the maintainer opts in with `block`. Defaults to `off`
+  // (the finding is never even produced — see maybeAddLockfileTamperFinding's mode gate in queue/processors.ts),
+  // so this branch only matters once a repo has explicitly turned the scan on.
+  if (code === "lockfile_tamper_risk") return gateMode(policy.lockfileIntegrityGateMode ?? "off") === "block";
+  // CLA / license-compatibility gate (#2564): blocks only when the maintainer opts into claMode: block.
+  // Defaults to off (evaluateClaCheck never even runs for an off repo, so the finding does not exist).
+  if (code === CLA_CONSENT_MISSING_CODE) return gateMode(policy.claGateMode ?? "off") === "block";
   return false;
 }
 

@@ -3,6 +3,8 @@ import {
   __aiReviewInternals,
   BEST_REVIEW_MODELS,
   buildTestEvidencePromptSection,
+  resolveEffectiveAiReviewOnMerge,
+  resolveEffectiveAiReviewPlan,
   runGittensoryAiReview,
   type GittensoryAiReviewInput,
 } from "../../src/services/ai-review";
@@ -386,6 +388,60 @@ describe("review.profile shapes the reviewer system prompt (#review-profile)", (
     // Absent / false ⇒ byte-identical prompt (no inline instruction).
     expect(await runInline(false)).not.toContain("INLINE FINDINGS");
     expect(await runInline(undefined)).not.toContain("INLINE FINDINGS");
+  });
+});
+
+describe("review.security_focus shapes the reviewer system prompt (#review-security-focus)", () => {
+  const systemPromptOf = (run: ReturnType<typeof vi.fn>): string =>
+    (run.mock.calls[0]?.[1] as { messages?: Array<{ content?: string }> })
+      ?.messages?.[0]?.content ?? "";
+  const runSecurityFocus = async (
+    securityFocus: GittensoryAiReviewInput["securityFocus"],
+    profile?: GittensoryAiReviewInput["profile"],
+  ) => {
+    const run = vi.fn(async () => ({ response: reviewJson() }));
+    const env = createTestEnv({
+      AI: { run } as unknown as Ai,
+      AI_SUMMARIES_ENABLED: "true",
+      AI_PUBLIC_COMMENTS_ENABLED: "true",
+      AI_DAILY_NEURON_BUDGET: "100000",
+    });
+    await runGittensoryAiReview(env, { ...baseInput, securityFocus, profile });
+    return systemPromptOf(run);
+  };
+
+  it("true appends the SECURITY FOCUS instruction naming the prioritized defect categories", async () => {
+    const system = await runSecurityFocus(true);
+    expect(system).toContain("SECURITY FOCUS");
+    expect(system).toContain("injection");
+    expect(system).toContain("authentication/authorization bypass");
+    expect(system).toContain("secret handling");
+    expect(system).toContain("unsafe deserialization");
+    expect(system).toContain("SSRF");
+    expect(system).toContain("path traversal");
+  });
+
+  it("absent / false leaves the prompt byte-identical (no security-focus suffix)", async () => {
+    const withFalse = await runSecurityFocus(false);
+    const withUndefined = await runSecurityFocus(undefined);
+    expect(withFalse).not.toContain("SECURITY FOCUS");
+    expect(withUndefined).not.toContain("SECURITY FOCUS");
+    expect(withFalse).toBe(withUndefined);
+  });
+
+  it("composes with (does not replace) the chill/assertive profile suffix — both appear together", async () => {
+    const chillPlusSecurity = await runSecurityFocus(true, "chill");
+    expect(chillPlusSecurity).toContain("CHILL");
+    expect(chillPlusSecurity).toContain("SECURITY FOCUS");
+
+    const assertivePlusSecurity = await runSecurityFocus(true, "assertive");
+    expect(assertivePlusSecurity).toContain("ASSERTIVE");
+    expect(assertivePlusSecurity).toContain("SECURITY FOCUS");
+
+    // security_focus alone (no profile) still appends only its own suffix.
+    const securityOnly = await runSecurityFocus(true, null);
+    expect(securityOnly).toContain("SECURITY FOCUS");
+    expect(securityOnly).not.toMatch(/CHILL|ASSERTIVE/);
   });
 });
 
@@ -937,6 +993,202 @@ describe("runGittensoryAiReview self-host dual-AI plan (#dual-ai-combiner)", () 
       onMerge: "both",
     });
     expect([...seen].sort()).toEqual(["groq", "ollama"]); // input reviewers win over the env plan
+  });
+
+  describe("per-repo onMerge is a REFINEMENT of the operator floor, never a bypass (#2567)", () => {
+    it("a repo without an override inherits the operator's onMerge floor unchanged", async () => {
+      const seen: string[] = [];
+      const env = planEnv(
+        {
+          reviewers: [{ model: "claude-code" }, { model: "codex" }],
+          combine: "synthesis",
+          onMerge: "either",
+        },
+        async (model) => {
+          seen.push(model);
+          // Only codex flags a blocker; under the operator's "either" floor, that alone must decide.
+          return model === "codex"
+            ? { response: reviewJson({ present: true, title: "Lone blocker" }) }
+            : { response: reviewJson({ present: false }) };
+        },
+      );
+      const result = await runGittensoryAiReview(env, {
+        ...baseInput,
+        mode: "block",
+        // No per-repo combine/onMerge/reviewers override at all.
+      });
+      if (result.status !== "ok") throw new Error("expected ok");
+      expect(result.consensusDefect?.title).toContain("Lone blocker"); // "either" honored unchanged
+      expect(await renderMetrics()).not.toContain("gittensory_ai_review_onmerge_clamped_total"); // no clamp fired
+    });
+
+    it("a repo tightening either -> either against an either floor is a no-op, not a clamp", async () => {
+      const env = planEnv(
+        { reviewers: [{ model: "claude-code" }, { model: "codex" }], combine: "synthesis", onMerge: "either" },
+        async (model) =>
+          model === "codex"
+            ? { response: reviewJson({ present: true, title: "Lone blocker" }) }
+            : { response: reviewJson({ present: false }) },
+      );
+      const result = await runGittensoryAiReview(env, {
+        ...baseInput,
+        mode: "block",
+        combine: "synthesis",
+        onMerge: "either", // same as the floor: a legitimate (no-op) tightening
+      });
+      if (result.status !== "ok") throw new Error("expected ok");
+      expect(result.consensusDefect?.title).toContain("Lone blocker");
+      expect(await renderMetrics()).not.toContain("gittensory_ai_review_onmerge_clamped_total"); // not a clamp
+    });
+
+    it("a repo attempting to LOOSEN either -> both against an either floor is clamped back to either, and it is metered (not silently ignored)", async () => {
+      const seen: string[] = [];
+      const env = planEnv(
+        { reviewers: [{ model: "claude-code" }, { model: "codex" }], combine: "synthesis", onMerge: "either" },
+        async (model) => {
+          seen.push(model);
+          // Only codex flags a blocker. Under "both" this would NOT block; under the clamped-back "either" it does.
+          return model === "codex"
+            ? { response: reviewJson({ present: true, title: "Lone blocker" }) }
+            : { response: reviewJson({ present: false }) };
+        },
+      );
+      const result = await runGittensoryAiReview(env, {
+        ...baseInput,
+        mode: "block",
+        combine: "synthesis",
+        onMerge: "both", // an attempted loosening of the operator's "either" floor
+      });
+      if (result.status !== "ok") throw new Error("expected ok");
+      // The clamp won: the lone blocker still decides, exactly as it would under "either".
+      expect(result.consensusDefect?.title).toContain("Lone blocker");
+      expect([...seen].sort()).toEqual(["claude-code", "codex"]);
+      // Surfaced via a metric, not silently dropped.
+      expect(await renderMetrics()).toContain('gittensory_ai_review_onmerge_clamped_total{mode="block"} 1');
+    });
+
+    it("a repo picking both against a both (or unset) operator floor is honored unclamped", async () => {
+      const env = planEnv(
+        { reviewers: [{ model: "claude-code" }, { model: "codex" }], combine: "synthesis", onMerge: "both" },
+        async (model) =>
+          model === "codex"
+            ? { response: reviewJson({ present: true, title: "Lone blocker" }) }
+            : { response: reviewJson({ present: false }) },
+      );
+      const result = await runGittensoryAiReview(env, {
+        ...baseInput,
+        mode: "block",
+        combine: "synthesis",
+        onMerge: "both", // matches a non-"either" floor: never clamped
+      });
+      if (result.status !== "ok") throw new Error("expected ok");
+      // Under "both", a single reviewer's blocker does NOT decide the outcome on its own.
+      expect(result.consensusDefect).toBeNull();
+      expect(await renderMetrics()).not.toContain("gittensory_ai_review_onmerge_clamped_total");
+    });
+
+    it("when the operator set no onMerge floor at all, any per-repo value is honored unclamped", async () => {
+      const env = planEnv(
+        { reviewers: [{ model: "claude-code" }, { model: "codex" }], combine: "synthesis" }, // no onMerge set
+        async (model) =>
+          model === "codex"
+            ? { response: reviewJson({ present: true, title: "Lone blocker" }) }
+            : { response: reviewJson({ present: false }) },
+      );
+      const result = await runGittensoryAiReview(env, {
+        ...baseInput,
+        mode: "block",
+        combine: "synthesis",
+        onMerge: "both", // no floor to violate
+      });
+      if (result.status !== "ok") throw new Error("expected ok");
+      expect(result.consensusDefect).toBeNull(); // "both" honored: lone blocker does not decide
+      expect(await renderMetrics()).not.toContain("gittensory_ai_review_onmerge_clamped_total");
+    });
+  });
+});
+
+describe("resolveEffectiveAiReviewOnMerge (#2567, pure precedence logic)", () => {
+  it("no repo override ⇒ the operator's floor (or null/undefined) passes through unclamped", () => {
+    expect(resolveEffectiveAiReviewOnMerge(null, "either")).toEqual({ onMerge: "either", clamped: false });
+    expect(resolveEffectiveAiReviewOnMerge(undefined, "both")).toEqual({ onMerge: "both", clamped: false });
+    expect(resolveEffectiveAiReviewOnMerge(undefined, undefined)).toEqual({ onMerge: undefined, clamped: false });
+    expect(resolveEffectiveAiReviewOnMerge(null, null)).toEqual({ onMerge: null, clamped: false });
+  });
+
+  it("a tightening or matching override (either -> either) always wins, never clamped", () => {
+    expect(resolveEffectiveAiReviewOnMerge("either", "either")).toEqual({ onMerge: "either", clamped: false });
+    expect(resolveEffectiveAiReviewOnMerge("either", "both")).toEqual({ onMerge: "either", clamped: false });
+    expect(resolveEffectiveAiReviewOnMerge("either", null)).toEqual({ onMerge: "either", clamped: false }); // no floor
+    expect(resolveEffectiveAiReviewOnMerge("either", undefined)).toEqual({ onMerge: "either", clamped: false }); // no floor
+  });
+
+  it("only an either-floor + both-override loosening attempt is clamped back to either", () => {
+    expect(resolveEffectiveAiReviewOnMerge("both", "either")).toEqual({ onMerge: "either", clamped: true });
+  });
+
+  it("a both override against a both (or unset) floor is honored unclamped — there is no stricter floor to violate", () => {
+    expect(resolveEffectiveAiReviewOnMerge("both", "both")).toEqual({ onMerge: "both", clamped: false });
+    expect(resolveEffectiveAiReviewOnMerge("both", null)).toEqual({ onMerge: "both", clamped: false });
+    expect(resolveEffectiveAiReviewOnMerge("both", undefined)).toEqual({ onMerge: "both", clamped: false });
+  });
+});
+
+describe("resolveEffectiveAiReviewPlan (#2567 gate-review follow-up: combine/reviewers can't bypass the onMerge floor)", () => {
+  const TWO_REVIEWERS = [{ model: "claude-code" }, { model: "codex" }];
+  const OPERATOR_FLOOR = { combine: "synthesis" as const, onMerge: "either" as const, reviewers: TWO_REVIEWERS };
+
+  it("no operator either-floor ⇒ combine/reviewers resolve unclamped, exactly like a direct override", () => {
+    const noFloor = resolveEffectiveAiReviewPlan({ combine: "single", reviewers: [{ model: "claude-code" }] }, { combine: "synthesis", onMerge: "both", reviewers: TWO_REVIEWERS });
+    expect(noFloor).toEqual({ combine: "single", onMerge: "both", reviewers: [{ model: "claude-code" }], clamped: false });
+
+    const noOperatorPlan = resolveEffectiveAiReviewPlan({ combine: "single", reviewers: [{ model: "claude-code" }] }, null);
+    expect(noOperatorPlan).toEqual({ combine: "single", onMerge: undefined, reviewers: [{ model: "claude-code" }], clamped: false });
+  });
+
+  it("gate finding: an either-floor operator plan cannot be neutered by a repo override reducing reviewer count", () => {
+    const reduced = resolveEffectiveAiReviewPlan({ reviewers: [{ model: "claude-code" }] }, OPERATOR_FLOOR);
+    expect(reduced).toEqual({ combine: "synthesis", onMerge: "either", reviewers: TWO_REVIEWERS, clamped: true });
+  });
+
+  it("gate finding: an either-floor operator plan cannot be neutered by a repo override switching to combine: single", () => {
+    const collapsed = resolveEffectiveAiReviewPlan({ combine: "single" }, OPERATOR_FLOOR);
+    expect(collapsed).toEqual({ combine: "synthesis", onMerge: "either", reviewers: TWO_REVIEWERS, clamped: true });
+  });
+
+  it("an either-floor operator plan with an UNCONFIGURED reviewers list (implicit default pair of 2) is still protected", () => {
+    const collapsed = resolveEffectiveAiReviewPlan({ combine: "single" }, { combine: "consensus", onMerge: "either", reviewers: undefined });
+    expect(collapsed).toEqual({ combine: "consensus", onMerge: "either", reviewers: undefined, clamped: true });
+  });
+
+  it("a repo override that keeps (or increases) the reviewer count and does not collapse to single passes through unclamped", () => {
+    const sameCount = resolveEffectiveAiReviewPlan({ combine: "consensus", reviewers: [{ model: "claude-code" }, { model: "ollama" }] }, OPERATOR_FLOOR);
+    expect(sameCount).toEqual({ combine: "consensus", onMerge: "either", reviewers: [{ model: "claude-code" }, { model: "ollama" }], clamped: false });
+  });
+
+  it("a repo tightening onMerge to either under an either floor is unaffected by the reviewer-count clamp (no reviewers/combine override at all)", () => {
+    const tightened = resolveEffectiveAiReviewPlan({ onMerge: "either" }, OPERATOR_FLOOR);
+    expect(tightened).toEqual({ combine: "synthesis", onMerge: "either", reviewers: TWO_REVIEWERS, clamped: false });
+  });
+
+  it("the onMerge clamp still fires independently when combine/reviewers are untouched", () => {
+    const onMergeOnly = resolveEffectiveAiReviewPlan({ onMerge: "both" }, OPERATOR_FLOOR);
+    expect(onMergeOnly).toEqual({ combine: "synthesis", onMerge: "either", reviewers: TWO_REVIEWERS, clamped: true });
+  });
+
+  // REGRESSION (gate-review follow-up on this same PR): the reviewer-count clamp must only fire on a REPO'S OWN
+  // combine override -- an operator plan that itself already sets combine: "single" (no repo override at all)
+  // must NOT be reported as clamped, since there is nothing for a repo to have bypassed.
+  it("an operator plan whose OWN combine is 'single' does not spuriously report clamped when the repo has no combine override at all", () => {
+    const operatorSingle = { combine: "single" as const, onMerge: "either" as const, reviewers: TWO_REVIEWERS };
+    const noRepoOverride = resolveEffectiveAiReviewPlan({}, operatorSingle);
+    expect(noRepoOverride).toEqual({ combine: "single", onMerge: "either", reviewers: TWO_REVIEWERS, clamped: false });
+  });
+
+  it("an operator plan whose OWN combine is 'single' is STILL clamped when the repo separately tries to reduce the reviewer count", () => {
+    const operatorSingle = { combine: "single" as const, onMerge: "either" as const, reviewers: TWO_REVIEWERS };
+    const reduced = resolveEffectiveAiReviewPlan({ reviewers: [{ model: "claude-code" }] }, operatorSingle);
+    expect(reduced).toEqual({ combine: "single", onMerge: "either", reviewers: TWO_REVIEWERS, clamped: true });
   });
 });
 

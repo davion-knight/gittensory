@@ -1746,13 +1746,34 @@ describe("local MCP git metadata collection", () => {
     }
     // Regression: Cypress/e2e and snapshot files must count as tests; before this they fell through to
     // isCodeFile and were wrongly counted as source in the local packet.
-    for (const file of ["components/Button.cy.ts", "e2e/login.e2e.tsx", "src/__snapshots__/Button.snap.ts"]) {
+    for (const file of ["components/Button.cy.ts", "e2e/login.e2e.tsx", "src/__snapshots__/Button.snap.ts", "e2e/checkout.cy.mts", "e2e/flow.e2e.mjs"]) {
       expect(isTestFile(file)).toBe(true);
       expect(isCodeFile(file)).toBe(false);
     }
     // Plain source stays source.
     expect(isTestFile("src/app.ts")).toBe(false);
     expect(isCodeFile("src/app.ts")).toBe(true);
+    // Node/TypeScript ESM + CommonJS module files are code; their .test/.spec variants are tests.
+    for (const file of ["src/loader.mjs", "src/legacy.cjs", "src/config.mts", "src/setup.cts"]) {
+      expect(isCodeFile(file)).toBe(true);
+      expect(isTestFile(file)).toBe(false);
+    }
+    for (const file of ["src/loader.test.mts", "src/legacy.spec.cjs"]) {
+      expect(isTestFile(file)).toBe(true);
+      expect(isCodeFile(file)).toBe(false);
+    }
+    // #2666 + #2743 parity: the pytest `test_*.py` prefix and the JVM/C#/Swift `SomethingTest(s)`/`Spec`
+    // class-suffix conventions were added to the server isTestPath but not this MCP copy — so the local
+    // predictor wrongly counted Java/Kotlin/Scala/C#/Swift tests and pytest-prefixed files as SOURCE.
+    for (const file of ["tests/test_utils.py", "test_api.py", "app/FooTests.java", "src/BarSpec.kt", "core/BazTest.scala", "svc/QuuxTests.cs", "ios/CorgeSpec.swift", "build/GraultTest.groovy"]) {
+      expect(isTestFile(file)).toBe(true);
+      expect(isCodeFile(file)).toBe(false);
+    }
+    // Case-sensitive on the PascalCase suffix: a JVM source merely ENDING in "test"/"spec" stays source.
+    for (const file of ["src/Latest.java", "core/manifest.scala", "app/MyService.kt"]) {
+      expect(isTestFile(file)).toBe(false);
+      expect(isCodeFile(file)).toBe(true);
+    }
   });
 
   it("extracts linked issues only from standalone closing keywords, not keyword substrings", async () => {

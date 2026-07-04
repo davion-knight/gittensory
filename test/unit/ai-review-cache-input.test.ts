@@ -12,12 +12,16 @@ const baseInput = (): AiReviewCacheInput => ({
   model: null,
   aiReviewAllAuthors: false,
   aiReviewCloseConfidence: null,
+  aiReviewCombine: null,
+  aiReviewOnMerge: null,
+  aiReviewReviewers: null,
   gatePack: null,
   reviewerPlan: null,
   selfHostProviderConfig: null,
   baseSha: null,
   reviewFiles: [],
   profile: null,
+  securityFocus: false,
   inlineComments: false,
   pathInstructions: [],
   pathGuidance: "",
@@ -239,6 +243,48 @@ describe("aiReviewCacheInputFingerprint", () => {
     expect(allAuthorsChanged).not.toBe(original);
     expect(closeConfidenceChanged).not.toBe(original);
     expect(gatePackChanged).not.toBe(original);
+    expect(repeated).toBe(original);
+  });
+
+  // #2567 gate-review follow-up: these directly shape the EFFECTIVE combine/onMerge/reviewers plan
+  // (resolveEffectiveAiReviewPlan), which drives whether/how a consensus defect is computed -- a repo
+  // flipping any of them must miss the cache, mirroring aiReviewCloseConfidence's own reasoning above.
+  it("changes when aiReviewCombine, aiReviewOnMerge, or aiReviewReviewers change", async () => {
+    const original = await aiReviewCacheInputFingerprint(baseInput());
+    const combineChanged = await aiReviewCacheInputFingerprint({ ...baseInput(), aiReviewCombine: "synthesis" });
+    const onMergeChanged = await aiReviewCacheInputFingerprint({ ...baseInput(), aiReviewOnMerge: "either" });
+    const reviewersChanged = await aiReviewCacheInputFingerprint({ ...baseInput(), aiReviewReviewers: [{ model: "claude-code" }] });
+    const repeated = await aiReviewCacheInputFingerprint(baseInput());
+
+    expect(combineChanged).not.toBe(original);
+    expect(onMergeChanged).not.toBe(original);
+    expect(reviewersChanged).not.toBe(original);
+    expect(repeated).toBe(original);
+  });
+
+  // REGRESSION (#2567 gate-review follow-up): nullish (no repo override, falls through to the built-in default
+  // reviewers per resolveEffectiveAiReviewPlan) and an explicit [] (a real, empty override) are DIFFERENT
+  // effective plans -- collapsing both to the same fingerprint would let a same-SHA cache hit replay a verdict
+  // produced under the other plan.
+  it("fingerprints aiReviewReviewers: null and aiReviewReviewers: [] DIFFERENTLY -- runtime semantics differ", async () => {
+    const nullish = await aiReviewCacheInputFingerprint({ ...baseInput(), aiReviewReviewers: null });
+    const undef = await aiReviewCacheInputFingerprint({ ...baseInput(), aiReviewReviewers: undefined });
+    const explicitEmpty = await aiReviewCacheInputFingerprint({ ...baseInput(), aiReviewReviewers: [] });
+
+    expect(nullish).toBe(undef);
+    expect(explicitEmpty).not.toBe(nullish);
+  });
+
+  it("changes when securityFocus toggles, independently of profile (#review-security-focus)", async () => {
+    const original = await aiReviewCacheInputFingerprint(baseInput());
+    const securityFocusOn = await aiReviewCacheInputFingerprint({ ...baseInput(), securityFocus: true });
+    const profileAndSecurityFocus = await aiReviewCacheInputFingerprint({ ...baseInput(), profile: "chill", securityFocus: true });
+    const profileOnly = await aiReviewCacheInputFingerprint({ ...baseInput(), profile: "chill" });
+    const repeated = await aiReviewCacheInputFingerprint(baseInput());
+
+    expect(securityFocusOn).not.toBe(original);
+    expect(profileAndSecurityFocus).not.toBe(profileOnly);
+    expect(profileAndSecurityFocus).not.toBe(securityFocusOn);
     expect(repeated).toBe(original);
   });
 });

@@ -80,6 +80,20 @@ declare global {
       onMerge?: import("./services/ai-review").OnMerge | undefined;
     };
     ADMIN_GITHUB_LOGINS?: string;
+    /** Install-wide contributor open-item cap (#2562, anti-abuse): the max PRs+issues a single non-owner/
+     *  admin/bot contributor may have open ACROSS EVERY repo this install gates, combined. Purely an
+     *  install-scoped aggregate over this same database (no cross-instance networking) -- catches an actor
+     *  spreading low-volume spam/farming PRs across several gated repos in one self-hosted install, which no
+     *  single repo's own contributorOpenPrCap/contributorOpenIssueCap can see. Unset/invalid (the default) = no
+     *  cap, byte-identical to today. Checked IN ADDITION TO (not instead of) the existing per-repo caps, in the
+     *  same contributor_cap short-circuit (src/settings/agent-actions.ts). A positive integer string (e.g. "20");
+     *  see src/settings/global-contributor-cap.ts for parsing. */
+    GLOBAL_CONTRIBUTOR_OPEN_ITEM_CAP?: string;
+    /** Install-wide default for the per-repo contributorCapCancelCi setting (#2462): "true"/"1"/"yes"/"on"
+     *  (case-insensitive) enables cancelling in-flight CI runs on a contributor_cap close for every repo that
+     *  hasn't explicitly configured its own value. Unset/blank/anything else = off (the existing behavior). A
+     *  repo's own `contributorCapCancelCi` (DB or `.gittensory.yml`) always takes precedence over this. */
+    CONTRIBUTOR_CAP_CANCEL_CI_DEFAULT?: string;
     GITHUB_WEBHOOK_SECRET: string;
     GITHUB_WEBHOOK_MAX_BODY_BYTES?: string;
     /** Webhook secret for the central Gittensory Orb GitHub App (#1255) — distinct from the review app's
@@ -155,8 +169,6 @@ declare global {
      *  secret, never a public var. When absent, BYOK is unavailable and review uses the configured instance
      *  reviewer when available. */
     TOKEN_ENCRYPTION_SECRET?: string;
-    RATE_LIMIT_TRUSTED_PROXIES?: string;
-    RATE_LIMIT_TRUSTED_PROXY_COUNT?: string;
     /** Convergence (Stage D): when truthy, the public PR comment is rendered by the unified-comment bridge
      *  (ONE in-place comment in the converged shape) instead of the legacy `buildPublicPrIntelligenceComment`
      *  panel. Default OFF — unset/false keeps the legacy panel byte-identical. */
@@ -310,6 +322,13 @@ declare global {
      *  unchanged). Once a winner closes, the next-lowest OPEN sibling becomes the winner on re-eval. See
      *  src/signals/duplicate-winner.ts. */
     GITTENSORY_DUPLICATE_WINNER?: string;
+    /** Open-PR file-path collision (#2653): when truthy, a live PR review enriches its own and its open
+     *  siblings' `changedFiles` from the `pull_request_files` cache (a plain D1 read — no extra GitHub calls)
+     *  before building the collision report, so two independently-open PRs touching the same file are flagged
+     *  the same way two title-similar PRs already are. A contributor's own two PRs sharing a file are never
+     *  flagged (see the same-author guard in buildCollisionReport). Default OFF — unset/false leaves every
+     *  PullRequestRecord's changedFiles unset, byte-identical to today. See src/signals/engine.ts prItem. */
+    GITTENSORY_OPEN_PR_FILE_COLLISION?: string;
   }
 }
 

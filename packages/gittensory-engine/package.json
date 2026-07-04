@@ -30,6 +30,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./miner-goal-spec-parse": {
+      "types": "./dist/miner-goal-spec-parse.d.ts",
+      "default": "./dist/miner-goal-spec-parse.js"
     }
   },
   "files": [
@@ -39,6 +43,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && tsc -p tsconfig.test.json && node --test \"dist-test/**/*.test.js\""
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

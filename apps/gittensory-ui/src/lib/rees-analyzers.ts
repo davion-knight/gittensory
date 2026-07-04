@@ -584,6 +584,79 @@ export const REES_ANALYZERS = [
         "File-level, not per-line: it reports each file's most recent prior toucher, never claiming a specific line's origin. Fail-safe and partial on cap.",
     },
   },
+  {
+    name: "approvalIntegrity",
+    title: "Review/approval integrity",
+    category: "history",
+    cost: "github-light",
+    defaultEnabled: true,
+    profiles: ["balanced", "deep"],
+    requires: ["github-token", "head-sha"],
+    limits: {
+      maxPages: 10,
+      reviewsPerPage: 100,
+    },
+    docs: {
+      summary:
+        "Flags review/approval integrity signals: an APPROVED review that predates the current head commit, the author approving their own PR, and a reviewer whose current review is still CHANGES_REQUESTED.",
+      looksAt:
+        "The PR's reviews (walked page by page, bounded), reduced to each reviewer's most recent submitted review — GitHub's own semantics for a reviewer's current vote.",
+      reports:
+        "Reviewer login, the finding kind, and (for a stale approval) a short commit-SHA prefix — never review body text.",
+      network: "Calls the GitHub PR-reviews API, paginated and bounded to a fixed page cap.",
+      notes:
+        "Structured-fields-only: reads state/commit_id/user.login/submitted_at, never diff or review-body text. Fail-safe on missing token/head SHA/fetch error.",
+    },
+  },
+  {
+    name: "ciCheckSignals",
+    title: "CI check-run signals",
+    category: "history",
+    cost: "github-light",
+    defaultEnabled: true,
+    profiles: ["balanced", "deep"],
+    requires: ["github-token", "head-sha"],
+    limits: {
+      maxCheckRuns: 100,
+      longRunThresholdMinutes: 15,
+    },
+    docs: {
+      summary:
+        "Flags a named check that only went green after one or more earlier non-success attempts at the current head commit, and any completed check run whose duration crossed a fixed threshold.",
+      looksAt:
+        "The head commit's check-runs (one bounded page), grouped by name and ordered by start time.",
+      reports:
+        "Check name and either the count of failed attempts before success, or the run's duration in minutes — never logs or output.",
+      network: "Calls the GitHub check-runs API once, bounded to one page.",
+      notes:
+        "Structured-fields-only: reads name/status/conclusion/started_at/completed_at, never check output or logs. Fail-safe on missing token/head SHA/fetch error.",
+    },
+  },
+  {
+    name: "undocumentedExport",
+    title: "Undocumented public exports",
+    category: "quality",
+    cost: "github-light",
+    defaultEnabled: true,
+    profiles: ["balanced", "deep"],
+    requires: ["files", "github-token", "head-sha"],
+    limits: {
+      maxFiles: 10,
+      maxFindings: 30,
+    },
+    docs: {
+      summary:
+        "Flags exports newly added to a package's public entrypoint (an index.* barrel) that ship with no adjacent doc comment.",
+      looksAt:
+        "Direct `export const/let/var/function/class/interface/type/enum` declarations added to changed index.* files, checked against the file fetched at headSha.",
+      reports:
+        "File, line, and symbol name of each undocumented added export — never file contents.",
+      network:
+        "One GitHub contents fetch per changed entrypoint (at headSha). Requires GitHub token forwarding for private repos.",
+      notes:
+        "Conservative: re-export lists (`export { x }`) and `export *` are ignored; a preceding `//` line (except tool directives like `eslint-disable`) or a real JSDoc `/**` block counts as documented (a plain `/* … */` block does not).",
+    },
+  },
 ] as const satisfies readonly ReesAnalyzerDoc[];
 
 export const REES_ANALYZER_NAMES = REES_ANALYZERS.map((analyzer) => analyzer.name);

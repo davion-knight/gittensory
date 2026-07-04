@@ -1,7 +1,9 @@
 import { scanActionPins } from "./actions-pin.js";
+import { scanApprovalIntegrity } from "./approval-integrity.js";
 import { scanAssetWeight } from "./asset-weight.js";
 import { scanChurnHotspot } from "./churn-hotspot.js";
 import { scanBlameLink } from "./blame-link.js";
+import { scanCiCheckSignals } from "./ci-check-signals.js";
 import { scanCodeowners } from "./codeowners.js";
 import { scanCommitSignature } from "./commit-signature.js";
 import { dependencyAnalyzer } from "./dependency/descriptor.js";
@@ -20,6 +22,7 @@ import { scanRedos } from "./redos.js";
 import { secretAnalyzer } from "./secret/descriptor.js";
 import { scanSecretLog } from "./secret-log.js";
 import { scanTyposquat } from "./typosquat.js";
+import { scanUndocumentedExport } from "./undocumented-export.js";
 import type {
   AnalyzerDescriptor,
   AnalyzerFn,
@@ -477,6 +480,110 @@ export const ANALYZER_DESCRIPTORS = [
     },
     run: (req, { signal, analysis, diagnostics }) =>
       scanBlameLink(req, fetch, { signal, analysis, diagnostics }),
+  }),
+  descriptor({
+    name: "approvalIntegrity",
+    title: "Review/approval integrity",
+    category: "history",
+    cost: "github-light",
+    defaultEnabled: true,
+    requires: ["github-token", "head-sha"],
+    limits: { maxPages: 10, reviewsPerPage: 100 },
+    docs: {
+      summary:
+        "Flags review/approval integrity signals: an APPROVED review that predates the current head commit, the author approving their own PR, and a reviewer whose current review is still CHANGES_REQUESTED.",
+      looksAt:
+        "The PR's reviews (walked page by page, bounded), reduced to each reviewer's most recent submitted review — GitHub's own semantics for a reviewer's current vote.",
+      reports: "Reviewer login, the finding kind, and (for a stale approval) a short commit-SHA prefix — never review body text.",
+      network: "Calls the GitHub PR-reviews API, paginated and bounded to a fixed page cap.",
+      notes:
+        "Structured-fields-only: reads state/commit_id/user.login/submitted_at, never diff or review-body text. Fail-safe on missing token/head SHA/fetch error.",
+    },
+    render: (findings, helpers) => {
+      if (!findings.length) return [];
+      const lines = ["### Review/approval integrity"];
+      for (const item of findings) {
+        if (item.kind === "stale-approval") {
+          lines.push(
+            `- ${helpers.safeCodeSpan(item.reviewer)}'s approval predates the current head commit (reviewed ${helpers.safeCodeSpan(item.reviewedShaPrefix)})`,
+          );
+        } else if (item.kind === "self-approval") {
+          lines.push(`- ${helpers.safeCodeSpan(item.reviewer)} approved their own PR`);
+        } else {
+          lines.push(`- ${helpers.safeCodeSpan(item.reviewer)}'s current review is still requesting changes`);
+        }
+      }
+      return lines;
+    },
+    run: (req, { signal, analysis, diagnostics }) =>
+      scanApprovalIntegrity(req, fetch, { signal, analysis, diagnostics }),
+  }),
+  descriptor({
+    name: "ciCheckSignals",
+    title: "CI check-run signals",
+    category: "history",
+    cost: "github-light",
+    defaultEnabled: true,
+    requires: ["github-token", "head-sha"],
+    limits: { maxCheckRuns: 100, longRunThresholdMinutes: 15 },
+    docs: {
+      summary:
+        "Flags a named check that only went green after one or more earlier non-success attempts at the current head commit, and any completed check run whose duration crossed a fixed threshold.",
+      looksAt:
+        "The head commit's check-runs (one bounded page), grouped by name and ordered by start time.",
+      reports: "Check name and either the count of failed attempts before success, or the run's duration in minutes — never logs or output.",
+      network: "Calls the GitHub check-runs API once, bounded to one page.",
+      notes:
+        "Structured-fields-only: reads name/status/conclusion/started_at/completed_at, never check output or logs. Fail-safe on missing token/head SHA/fetch error.",
+    },
+    render: (findings, helpers) => {
+      if (!findings.length) return [];
+      const lines = ["### CI check-run signals"];
+      for (const item of findings) {
+        if (item.kind === "retried-after-failure") {
+          const attempt = item.failedAttempts === 1 ? "attempt" : "attempts";
+          lines.push(
+            `- ${helpers.safeCodeSpan(item.checkName)} only passed after ${item.failedAttempts} earlier non-success ${attempt} at this commit`,
+          );
+        } else {
+          const minute = item.durationMinutes === 1 ? "minute" : "minutes";
+          lines.push(`- ${helpers.safeCodeSpan(item.checkName)} ran for ${item.durationMinutes} ${minute}`);
+        }
+      }
+      return lines;
+    },
+    run: (req, { signal, analysis, diagnostics }) =>
+      scanCiCheckSignals(req, fetch, { signal, analysis, diagnostics }),
+  }),
+  descriptor({
+    name: "undocumentedExport",
+    title: "Undocumented public exports",
+    category: "quality",
+    cost: "github-light",
+    defaultEnabled: true,
+    requires: ["files", "github-token", "head-sha"],
+    limits: { maxFiles: 10, maxFindings: 30 },
+    docs: {
+      summary:
+        "Flags exports newly added to a package's public entrypoint (an index.* barrel) that ship with no adjacent doc comment.",
+      looksAt:
+        "Direct `export const/let/var/function/class/interface/type/enum` declarations added to changed index.* files, checked against the file fetched at headSha.",
+      reports: "File, line, and symbol name of each undocumented added export — never file contents.",
+      network: "One GitHub contents fetch per changed entrypoint (at headSha). Requires GitHub token forwarding for private repos.",
+      notes:
+        "Conservative: re-export lists (`export { x }`) and `export *` are ignored; a preceding `//` line (except tool directives like `eslint-disable`) or a real JSDoc `/**` block counts as documented (a plain `/* … */` block does not).",
+    },
+    render: (findings, helpers) => {
+      if (!findings.length) return [];
+      const lines = ["### Undocumented public exports (new public surface with no doc comment)"];
+      for (const item of findings) {
+        lines.push(
+          `- ${helpers.safeCodeSpan(`${item.file}:${item.line}`)} exports ${helpers.safeCodeSpan(item.symbol)} with no adjacent doc comment`,
+        );
+      }
+      return lines;
+    },
+    run: (req, { signal }) => scanUndocumentedExport(req, fetch, { signal }),
   }),
 ] as const satisfies readonly AnyAnalyzerDescriptor[];
 

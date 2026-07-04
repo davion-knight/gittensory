@@ -846,7 +846,9 @@ test("renderBrief: renders the license block", () => {
     ],
   });
   assert.match(r.promptSection, /Dependency licenses/);
-  assert.match(r.promptSection, /`g@1` \(npm\): GPL-3\.0 — \*\*copyleft\*\*/);
+  // The declared license text now renders inside its own escaped code span (like package@version), so a benign
+  // SPDX id is preserved verbatim while a hostile one can't break out of the span.
+  assert.match(r.promptSection, /`g@1` \(npm\): `GPL-3\.0` — \*\*copyleft\*\*/);
 });
 
 test("buildBrief: license analyzer runs alongside the others", async () => {
@@ -1912,7 +1914,8 @@ test("renderBrief: renders the EOL block", () => {
   assert.match(r.promptSection, /End-of-life runtimes/);
   assert.match(
     r.promptSection,
-    /pins nodejs 18 — \*\*END-OF-LIFE\*\* \(EOL 2023-06-01\)/,
+    // product + version are now carried in a code span (safeCodeSpan), escaped like the actionPin sibling.
+    /pins `nodejs 18` — \*\*END-OF-LIFE\*\* \(EOL 2023-06-01\)/,
   );
 });
 

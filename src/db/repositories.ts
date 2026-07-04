@@ -57,6 +57,7 @@ import {
   upstreamSourceSnapshots,
   webhookEvents,
 } from "./schema";
+import { MAX_REVIEW_NAG_COOLDOWN_DAYS } from "../settings/agent-actions";
 import type {
   Advisory,
   AdvisoryFinding,
@@ -162,7 +163,10 @@ import { classifyMcpClientVersion, LATEST_RECOMMENDED_MCP_VERSION, MINIMUM_SUPPO
 import { DEFAULT_COMMAND_AUTHORIZATION_POLICY, normalizeCommandAuthorizationPolicy } from "../settings/command-authorization";
 import { normalizeContributorBlacklist } from "../settings/contributor-blacklist";
 import { normalizeAutoCloseExemptLogins } from "../settings/auto-close-exempt";
+import { DEFAULT_GLOBAL_MODERATION_CONFIG, MAX_MODERATION_VIOLATION_DECAY_DAYS, normalizeModerationLabel, normalizeModerationRules, type GlobalModerationConfig, type ModerationRuleType } from "../settings/moderation-rules";
 import { normalizeAutonomyPolicy, normalizeAutoMaintainPolicy, DEFAULT_AUTO_MAINTAIN_POLICY } from "../settings/autonomy";
+import { DEFAULT_TYPE_LABELS, normalizeTypeLabelSet } from "../settings/pr-type-label";
+import { DEFAULT_LINKED_ISSUE_LABEL_PROPAGATION, normalizeLinkedIssueLabelPropagationConfig } from "../review/linked-issue-label-propagation";
 import { decryptSecret, encryptSecret, sha256Hex } from "../utils/crypto";
 import { errorMessage, jsonString, nowIso, parseJson, repoParts } from "../utils/json";
 import { PUBLIC_LOCAL_PATH_SCRUB_PATTERN } from "../signals/redaction";
@@ -258,6 +262,12 @@ export async function getInstallation(env: Env, installationId: number): Promise
   const db = getDb(env.DB);
   const [row] = await db.select().from(installations).where(eq(installations.id, installationId)).limit(1);
   return row ? toInstallationRecord(row) : null;
+}
+
+export async function updateInstallationPermissions(env: Env, installationId: number, permissions: Record<string, string>): Promise<void> {
+  if (Object.keys(permissions).length === 0) return;
+  const db = getDb(env.DB);
+  await db.update(installations).set({ permissionsJson: jsonString(permissions), updatedAt: nowIso() }).where(eq(installations.id, installationId));
 }
 
 export async function listInstallations(env: Env): Promise<InstallationRecord[]> {
@@ -487,6 +497,9 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
       aiReviewAllAuthors: false,
       closeOwnerAuthors: false,
       autoLabelEnabled: true,
+      typeLabelsEnabled: true,
+      typeLabels: { ...DEFAULT_TYPE_LABELS },
+      linkedIssueLabelPropagation: { ...DEFAULT_LINKED_ISSUE_LABEL_PROPAGATION, mappings: [] },
       gittensorLabel: "gittensor",
       blacklistLabel: "slop",
       createMissingLabel: true,
@@ -505,14 +518,24 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
       contributorOpenPrCap: null,
       contributorOpenIssueCap: null,
       contributorCapLabel: "over-contributor-limit",
+      contributorCapCancelCi: null,
       reviewNagPolicy: "off",
       reviewNagMaxPings: 3,
       reviewNagCooldownDays: 5,
       reviewNagLabel: "review-nag-cooldown",
+      reviewNagMonitoredMentions: [],
       autoCloseExemptLogins: [],
       requireFreshRebaseWindowMinutes: null,
       accountAgeThresholdDays: null,
       newAccountLabel: "new-account",
+      commandRateLimitPolicy: "off",
+      commandRateLimitMaxPerWindow: 20,
+      commandRateLimitAiMaxPerWindow: 5,
+      commandRateLimitWindowHours: 24,
+      moderationGateMode: "inherit",
+      moderationRules: undefined,
+      moderationWarningLabel: undefined,
+      moderationBannedLabel: undefined,
     };
   }
   return {
@@ -542,6 +565,9 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
     aiReviewAllAuthors: row.aiReviewAllAuthors,
     closeOwnerAuthors: row.closeOwnerAuthors,
     autoLabelEnabled: row.autoLabelEnabled,
+    typeLabelsEnabled: row.typeLabelsEnabled,
+    typeLabels: parseTypeLabelSet(row.typeLabelsJson),
+    linkedIssueLabelPropagation: parseLinkedIssueLabelPropagationConfig(row.linkedIssueLabelPropagationJson),
     gittensorLabel: row.gittensorLabel,
     blacklistLabel: row.blacklistLabel,
     createMissingLabel: row.createMissingLabel,
@@ -560,14 +586,24 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
     contributorOpenPrCap: normalizeOpenItemCap(row.contributorOpenPrCap),
     contributorOpenIssueCap: normalizeOpenItemCap(row.contributorOpenIssueCap),
     contributorCapLabel: row.contributorCapLabel,
+    contributorCapCancelCi: row.contributorCapCancelCi,
     reviewNagPolicy: normalizeReviewNagPolicy(row.reviewNagPolicy),
     reviewNagMaxPings: normalizePositiveIntWithDefault(row.reviewNagMaxPings, 3),
-    reviewNagCooldownDays: normalizePositiveIntWithDefault(row.reviewNagCooldownDays, 5),
+    reviewNagCooldownDays: normalizeReviewNagCooldownDays(row.reviewNagCooldownDays, 5),
     reviewNagLabel: row.reviewNagLabel,
+    reviewNagMonitoredMentions: parseAutoCloseExemptLogins(row.reviewNagMonitoredMentionsJson),
     autoCloseExemptLogins: parseAutoCloseExemptLogins(row.autoCloseExemptLoginsJson),
     requireFreshRebaseWindowMinutes: normalizeOpenItemCap(row.requireFreshRebaseWindowMinutes),
     accountAgeThresholdDays: normalizeOpenItemCap(row.accountAgeThresholdDays),
     newAccountLabel: row.newAccountLabel,
+    commandRateLimitPolicy: normalizeCommandRateLimitPolicy(row.commandRateLimitPolicy),
+    commandRateLimitMaxPerWindow: normalizePositiveIntWithDefault(row.commandRateLimitMaxPerWindow, 20),
+    commandRateLimitAiMaxPerWindow: normalizePositiveIntWithDefault(row.commandRateLimitAiMaxPerWindow, 5),
+    commandRateLimitWindowHours: normalizePositiveIntWithDefault(row.commandRateLimitWindowHours, 24),
+    moderationGateMode: normalizeModerationGateMode(row.moderationGateMode),
+    moderationRules: parseModerationRulesColumn(row.moderationRulesJson),
+    moderationWarningLabel: normalizeModerationLabel(row.moderationWarningLabel),
+    moderationBannedLabel: normalizeModerationLabel(row.moderationBannedLabel),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -602,7 +638,11 @@ export async function upsertGlobalContributorBlacklist(env: Env, input: { contri
 }
 
 export async function upsertRepositorySettings(env: Env, settings: Partial<RepositorySettings> & { repoFullName: string }): Promise<RepositorySettings> {
-  const resolved: RepositorySettings = {
+  // `satisfies` (not a `: RepositorySettings` annotation) so the `?? default` coalescing below keeps its
+  // narrower inferred type (`string`, never `null`) for blacklistLabel/contributorCapLabel/reviewNagLabel --
+  // the DB columns backing them stay NOT NULL (#label-scoping: only `.gittensory.yml`, not the dashboard/API
+  // write path, can express "close without any label" via an explicit null; see focus-manifest.ts).
+  const resolved = {
     repoFullName: settings.repoFullName,
     commentMode: settings.commentMode ?? "detected_contributors_only",
     publicAudienceMode: settings.publicAudienceMode ?? "oss_maintainer",
@@ -629,6 +669,9 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
     aiReviewAllAuthors: settings.aiReviewAllAuthors ?? false,
     closeOwnerAuthors: settings.closeOwnerAuthors ?? false,
     autoLabelEnabled: settings.autoLabelEnabled ?? true,
+    typeLabelsEnabled: settings.typeLabelsEnabled ?? true,
+    typeLabels: normalizeTypeLabelSet(settings.typeLabels, []),
+    linkedIssueLabelPropagation: normalizeLinkedIssueLabelPropagationConfig(settings.linkedIssueLabelPropagation, []),
     gittensorLabel: settings.gittensorLabel ?? "gittensor",
     blacklistLabel: settings.blacklistLabel ?? "slop",
     createMissingLabel: settings.createMissingLabel ?? true,
@@ -647,15 +690,25 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
     contributorOpenPrCap: normalizeOpenItemCap(settings.contributorOpenPrCap),
     contributorOpenIssueCap: normalizeOpenItemCap(settings.contributorOpenIssueCap),
     contributorCapLabel: settings.contributorCapLabel ?? "over-contributor-limit",
+    contributorCapCancelCi: typeof settings.contributorCapCancelCi === "boolean" ? settings.contributorCapCancelCi : null,
     reviewNagPolicy: normalizeReviewNagPolicy(settings.reviewNagPolicy),
     reviewNagMaxPings: normalizePositiveIntWithDefault(settings.reviewNagMaxPings, 3),
-    reviewNagCooldownDays: normalizePositiveIntWithDefault(settings.reviewNagCooldownDays, 5),
+    reviewNagCooldownDays: normalizeReviewNagCooldownDays(settings.reviewNagCooldownDays, 5),
     reviewNagLabel: settings.reviewNagLabel ?? "review-nag-cooldown",
+    reviewNagMonitoredMentions: normalizeAutoCloseExemptLogins(settings.reviewNagMonitoredMentions).logins,
     autoCloseExemptLogins: normalizeAutoCloseExemptLogins(settings.autoCloseExemptLogins).logins,
     requireFreshRebaseWindowMinutes: normalizeOpenItemCap(settings.requireFreshRebaseWindowMinutes),
     accountAgeThresholdDays: normalizeOpenItemCap(settings.accountAgeThresholdDays),
     newAccountLabel: settings.newAccountLabel ?? "new-account",
-  };
+    commandRateLimitPolicy: normalizeCommandRateLimitPolicy(settings.commandRateLimitPolicy),
+    commandRateLimitMaxPerWindow: normalizePositiveIntWithDefault(settings.commandRateLimitMaxPerWindow, 20),
+    commandRateLimitAiMaxPerWindow: normalizePositiveIntWithDefault(settings.commandRateLimitAiMaxPerWindow, 5),
+    commandRateLimitWindowHours: normalizePositiveIntWithDefault(settings.commandRateLimitWindowHours, 24),
+    moderationGateMode: normalizeModerationGateMode(settings.moderationGateMode),
+    moderationRules: settings.moderationRules,
+    moderationWarningLabel: normalizeModerationLabel(settings.moderationWarningLabel),
+    moderationBannedLabel: normalizeModerationLabel(settings.moderationBannedLabel),
+  } satisfies RepositorySettings;
   const db = getDb(env.DB);
   await db
     .insert(repositorySettings)
@@ -686,6 +739,9 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
       aiReviewAllAuthors: resolved.aiReviewAllAuthors,
       closeOwnerAuthors: resolved.closeOwnerAuthors,
       autoLabelEnabled: resolved.autoLabelEnabled,
+      typeLabelsEnabled: resolved.typeLabelsEnabled,
+      typeLabelsJson: jsonString(resolved.typeLabels),
+      linkedIssueLabelPropagationJson: jsonString(resolved.linkedIssueLabelPropagation),
       gittensorLabel: resolved.gittensorLabel,
       blacklistLabel: resolved.blacklistLabel,
       createMissingLabel: resolved.createMissingLabel,
@@ -704,14 +760,24 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
       contributorOpenPrCap: resolved.contributorOpenPrCap,
       contributorOpenIssueCap: resolved.contributorOpenIssueCap,
       contributorCapLabel: resolved.contributorCapLabel,
+      contributorCapCancelCi: resolved.contributorCapCancelCi,
       reviewNagPolicy: resolved.reviewNagPolicy,
       reviewNagMaxPings: resolved.reviewNagMaxPings,
       reviewNagCooldownDays: resolved.reviewNagCooldownDays,
       reviewNagLabel: resolved.reviewNagLabel,
+      reviewNagMonitoredMentionsJson: jsonString(resolved.reviewNagMonitoredMentions),
       autoCloseExemptLoginsJson: jsonString(resolved.autoCloseExemptLogins),
       requireFreshRebaseWindowMinutes: resolved.requireFreshRebaseWindowMinutes,
       accountAgeThresholdDays: resolved.accountAgeThresholdDays,
       newAccountLabel: resolved.newAccountLabel,
+      commandRateLimitPolicy: resolved.commandRateLimitPolicy,
+      commandRateLimitMaxPerWindow: resolved.commandRateLimitMaxPerWindow,
+      commandRateLimitAiMaxPerWindow: resolved.commandRateLimitAiMaxPerWindow,
+      commandRateLimitWindowHours: resolved.commandRateLimitWindowHours,
+      moderationGateMode: resolved.moderationGateMode,
+      moderationRulesJson: resolved.moderationRules === undefined ? null : jsonString(resolved.moderationRules),
+      moderationWarningLabel: resolved.moderationWarningLabel ?? null,
+      moderationBannedLabel: resolved.moderationBannedLabel ?? null,
       updatedAt: nowIso(),
     })
     .onConflictDoUpdate({
@@ -744,6 +810,9 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
         aiReviewAllAuthors: resolved.aiReviewAllAuthors,
         closeOwnerAuthors: resolved.closeOwnerAuthors,
         autoLabelEnabled: resolved.autoLabelEnabled,
+        typeLabelsEnabled: resolved.typeLabelsEnabled,
+        typeLabelsJson: jsonString(resolved.typeLabels),
+        linkedIssueLabelPropagationJson: jsonString(resolved.linkedIssueLabelPropagation),
         gittensorLabel: resolved.gittensorLabel,
         blacklistLabel: resolved.blacklistLabel,
         createMissingLabel: resolved.createMissingLabel,
@@ -762,14 +831,24 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
         contributorOpenPrCap: resolved.contributorOpenPrCap,
         contributorOpenIssueCap: resolved.contributorOpenIssueCap,
         contributorCapLabel: resolved.contributorCapLabel,
+        contributorCapCancelCi: resolved.contributorCapCancelCi,
         reviewNagPolicy: resolved.reviewNagPolicy,
         reviewNagMaxPings: resolved.reviewNagMaxPings,
         reviewNagCooldownDays: resolved.reviewNagCooldownDays,
         reviewNagLabel: resolved.reviewNagLabel,
+        reviewNagMonitoredMentionsJson: jsonString(resolved.reviewNagMonitoredMentions),
         autoCloseExemptLoginsJson: jsonString(resolved.autoCloseExemptLogins),
         requireFreshRebaseWindowMinutes: resolved.requireFreshRebaseWindowMinutes,
         accountAgeThresholdDays: resolved.accountAgeThresholdDays,
         newAccountLabel: resolved.newAccountLabel,
+        commandRateLimitPolicy: resolved.commandRateLimitPolicy,
+        commandRateLimitMaxPerWindow: resolved.commandRateLimitMaxPerWindow,
+        commandRateLimitAiMaxPerWindow: resolved.commandRateLimitAiMaxPerWindow,
+        commandRateLimitWindowHours: resolved.commandRateLimitWindowHours,
+        moderationGateMode: resolved.moderationGateMode,
+        moderationRulesJson: resolved.moderationRules === undefined ? null : jsonString(resolved.moderationRules),
+        moderationWarningLabel: resolved.moderationWarningLabel ?? null,
+        moderationBannedLabel: resolved.moderationBannedLabel ?? null,
         updatedAt: nowIso(),
       },
     });
@@ -2293,6 +2372,169 @@ export async function countRecentAuditEventsForActorAndTarget(env: Env, actor: s
   return row.count;
 }
 
+/** Moderation-rules engine (#selfhost-mod-engine): the actor's TOTAL violation count across every rule type in
+ *  `eventTypes` and EVERY repo this install tracks (no targetKey/route scoping -- `audit_events` carries no
+ *  repo/installation column at all, so this is inherently install-wide, mirroring the install-wide contributor
+ *  cap's own use of this same table). `sinceIso` is optional: omitted ⇒ the PERMANENT lifetime tally (the
+ *  default moderation-decay behavior); provided ⇒ only violations within that rolling window count, for an
+ *  operator who configured `violationDecayDays`. */
+export async function countModerationViolationsForActor(env: Env, actor: string, eventTypes: string[], sinceIso?: string): Promise<number> {
+  const db = getDb(env.DB);
+  const conditions = [eq(auditEvents.actor, actor), inArray(auditEvents.eventType, eventTypes)];
+  if (sinceIso !== undefined) conditions.push(gte(auditEvents.createdAt, sinceIso));
+  const [row] = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(auditEvents)
+    .where(and(...conditions));
+  /* v8 ignore next -- count(*) always returns exactly one row; the empty-array guard only satisfies the destructure type. */
+  if (!row) return 0;
+  return row.count;
+}
+
+/** Moderation-rules engine: whether a violation has ALREADY been recorded for this EXACT (actor, eventType,
+ *  targetKey) tuple. Deliberately NO time window (unlike hasRecentAuditEvent's sinceIso) -- "this PR/issue
+ *  already contributed a violation of this kind to the tally" is permanently true once recorded, not
+ *  something that should re-count on a later replay just because time has passed. */
+export async function hasModerationViolationForTarget(env: Env, actor: string, eventType: string, targetKey: string): Promise<boolean> {
+  const db = getDb(env.DB);
+  const rows = await db
+    .select({ id: auditEvents.id })
+    .from(auditEvents)
+    .where(and(eq(auditEvents.actor, actor), eq(auditEvents.eventType, eventType), eq(auditEvents.targetKey, targetKey)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+/** Moderation-rules engine: record one violation for `actor` under the given rule's `eventType` (see
+ *  `MODERATION_VIOLATION_EVENT_TYPE` in settings/moderation-rules.ts). `targetKey` carries the repo#number,
+ *  and -- unlike the COUNT query above, which deliberately does not scope by it -- IS the idempotency key here
+ *  (#gate-flagged): a webhook redelivery or queue retry that re-executes an already-recorded close must not
+ *  double-count the SAME enforcement action toward the ban threshold. Returns whether a NEW row was actually
+ *  inserted (false for an already-recorded duplicate), so the caller can skip redundant escalation work
+ *  (re-labeling, re-checking the ban threshold) when nothing new actually happened. Best-effort, not a hard
+ *  guarantee under true concurrency (no unique constraint on audit_events for this) -- matches this
+ *  codebase's other check-then-act coalescing helpers, and is more than sufficient for the sequential
+ *  redelivery/retry pattern it defends against. */
+export async function recordModerationViolation(env: Env, args: { eventType: string; actor: string; targetKey: string; repoFullName: string; ruleReason: string }): Promise<boolean> {
+  if (await hasModerationViolationForTarget(env, args.actor, args.eventType, args.targetKey)) return false;
+  await recordAuditEvent(env, {
+    eventType: args.eventType,
+    actor: args.actor,
+    targetKey: args.targetKey,
+    outcome: "completed",
+    detail: args.ruleReason,
+    metadata: { repoFullName: args.repoFullName },
+  });
+  return true;
+}
+
+// #gate-flagged: same non-clamping, non-rounding shape as normalizeOpenItemCap, PLUS an upper bound --
+// unlike an ordinary open-item cap, this value feeds Date arithmetic on the LIVE close path
+// (`Date.now() - violationDecayDays * 86400000`); an unbounded value (e.g. a typo adding extra zeros) can
+// overflow into an Invalid Date, and calling .toISOString() on an Invalid Date THROWS, crashing the close.
+// Clamped (Math.min), not dropped to null, mirroring normalizeReviewNagCooldownDays' own clamping shape for
+// the same "still meaningful, just bounded" family of day-count settings.
+function normalizeModerationDecayDays(value: number | null | undefined): number | null {
+  const parsed = normalizeOpenItemCap(value);
+  return parsed === null ? null : Math.min(parsed, MAX_MODERATION_VIOLATION_DECAY_DAYS);
+}
+
+/** Read the singleton global moderation-rules engine config (#selfhost-mod-engine). A missing table/row fails
+ *  open to the FULL {@link DEFAULT_GLOBAL_MODERATION_CONFIG} (`enabled: false`) -- a DB hiccup on this path
+ *  must never accidentally turn ON a layer capable of auto-banning a contributor across every gated repo.
+ *  Malformed JSON in an otherwise-present row is narrower: only `rules_json` degrades (to an empty rules
+ *  list, via `normalizeModerationRules`), while every other column is still read from the row as normal. */
+export async function getGlobalModerationConfig(env: Env): Promise<GlobalModerationConfig> {
+  try {
+    const row = await env.DB.prepare(
+      "SELECT enabled, rules_json, warning_label, banned_label, ban_threshold, violation_decay_days, auto_blacklist_on_ban FROM global_moderation_config WHERE id = 'singleton'",
+    ).first<{
+      enabled: number;
+      rules_json: string;
+      warning_label: string;
+      banned_label: string;
+      ban_threshold: number;
+      violation_decay_days: number | null;
+      auto_blacklist_on_ban: number;
+    }>();
+    if (!row) return DEFAULT_GLOBAL_MODERATION_CONFIG;
+    return {
+      enabled: row.enabled === 1,
+      rules: normalizeModerationRules(parseJson<unknown>(row.rules_json, null)).rules,
+      warningLabel: normalizeModerationLabel(row.warning_label) ?? DEFAULT_GLOBAL_MODERATION_CONFIG.warningLabel,
+      bannedLabel: normalizeModerationLabel(row.banned_label) ?? DEFAULT_GLOBAL_MODERATION_CONFIG.bannedLabel,
+      banThreshold: normalizePositiveIntWithDefault(row.ban_threshold, DEFAULT_GLOBAL_MODERATION_CONFIG.banThreshold),
+      violationDecayDays: normalizeModerationDecayDays(row.violation_decay_days),
+      autoBlacklistOnBan: row.auto_blacklist_on_ban === 1,
+    };
+  } catch {
+    return DEFAULT_GLOBAL_MODERATION_CONFIG;
+  }
+}
+
+/** Upsert the singleton global moderation-rules engine config. Input is normalized/validated once so malformed
+ *  stored data never reaches enforcement. Returns the normalized persisted config for convenience/tests. */
+export async function upsertGlobalModerationConfig(
+  env: Env,
+  input: Partial<GlobalModerationConfig> & { updatedBy?: string | null },
+): Promise<GlobalModerationConfig> {
+  const current = await getGlobalModerationConfig(env);
+  const resolved: GlobalModerationConfig = {
+    enabled: input.enabled ?? current.enabled,
+    rules: input.rules ? normalizeModerationRules(input.rules as unknown).rules : current.rules,
+    warningLabel: normalizeModerationLabel(input.warningLabel) ?? current.warningLabel,
+    bannedLabel: normalizeModerationLabel(input.bannedLabel) ?? current.bannedLabel,
+    banThreshold: input.banThreshold !== undefined ? normalizePositiveIntWithDefault(input.banThreshold, current.banThreshold) : current.banThreshold,
+    violationDecayDays: input.violationDecayDays !== undefined ? normalizeModerationDecayDays(input.violationDecayDays) : current.violationDecayDays,
+    autoBlacklistOnBan: input.autoBlacklistOnBan ?? current.autoBlacklistOnBan,
+  };
+  await env.DB.prepare(
+    "INSERT INTO global_moderation_config (id, enabled, rules_json, warning_label, banned_label, ban_threshold, violation_decay_days, auto_blacklist_on_ban, updated_at, updated_by) VALUES ('singleton', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?) ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, rules_json = excluded.rules_json, warning_label = excluded.warning_label, banned_label = excluded.banned_label, ban_threshold = excluded.ban_threshold, violation_decay_days = excluded.violation_decay_days, auto_blacklist_on_ban = excluded.auto_blacklist_on_ban, updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+  )
+    .bind(
+      resolved.enabled ? 1 : 0,
+      jsonString(resolved.rules),
+      resolved.warningLabel,
+      resolved.bannedLabel,
+      resolved.banThreshold,
+      resolved.violationDecayDays,
+      resolved.autoBlacklistOnBan ? 1 : 0,
+      input.updatedBy ?? null,
+    )
+    .run();
+  return resolved;
+}
+
+/** Whether `deliveryId` has ALREADY been recorded for this (actor, eventType, targetKey) within `sinceIso` --
+ *  makes a counting/rate-limit check idempotent against a REDELIVERED or retried webhook event (GitHub can
+ *  and does redeliver the same issue_comment event), which would otherwise increment the counter twice for
+ *  one real invocation and can incorrectly rate-limit it (#2560). Scoped to a short recent window, not the
+ *  full rate-limit window -- a genuine redelivery lands within seconds, not hours later.
+ *  Gate review finding: an earlier version matched deliveryId IN MEMORY over a `.limit(50)` slice with no
+ *  ORDER BY -- once an actor accumulated more than 50 matching rows within the window (a burst/spam scenario,
+ *  exactly what this feature exists to handle), the row carrying the original deliveryId could be excluded
+ *  from that arbitrary slice, producing a false negative right when it matters most. The deliveryId match is
+ *  now pushed into the SQL predicate itself (json_extract on metadataJson, mirroring
+ *  countRecentDeadLettersByType's own json_extract usage below), so it's an exact match against every row in
+ *  the window regardless of how many other rows exist for this actor/event/target. */
+export async function hasAuditEventForDelivery(env: Env, actor: string, eventType: string, targetKey: string, deliveryId: string, sinceIso: string): Promise<boolean> {
+  const db = getDb(env.DB);
+  const [row] = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(auditEvents)
+    .where(
+      and(
+        eq(auditEvents.actor, actor),
+        eq(auditEvents.eventType, eventType),
+        eq(auditEvents.targetKey, targetKey),
+        gte(auditEvents.createdAt, sinceIso),
+        sql`json_extract(${auditEvents.metadataJson}, '$.deliveryId') = ${deliveryId}`,
+      ),
+    );
+  /* v8 ignore next -- count(*) always returns exactly one row; the empty-array guard only satisfies the destructure type. */
+  return (row?.count ?? 0) > 0;
+}
+
 /** Observability for the queue dead-letter rate (#1276): how many jobs (across BOTH the maintenance and webhook
  *  lanes) were dead-lettered since `sinceIso`. Reads the `github_app.dlq_dead_lettered` audit events written by
  *  processDlqBatch — NOT gated behind any review-ops flag, so the infra drop rate is always visible. */
@@ -3053,6 +3295,99 @@ export async function countOpenPullRequests(env: Env, fullName: string): Promise
   return Number(row?.count ?? 0);
 }
 
+const INSTALLATION_REPO_LIST_LIMIT = 20_000;
+
+/** List every repo's fullName tracked under one installation (regression fix, #2562): pullRequests/issues have
+ *  no installationId column of their own (only repoFullName, a plain string, matched by convention against
+ *  repositories.fullName -- this codebase has no Drizzle joins to lean on instead), so scoping a cross-repo
+ *  aggregate to one install means resolving its repo set FIRST, mirroring markRepositoriesRemovedFromInstallation
+ *  (same file).
+ *
+ * INSTALLATION_REPO_LIST_LIMIT (gate finding): raised far above any realistic install size so truncation should
+ * never occur in practice, but a silently truncated repo set would understate countOpenItemsForAuthorAcrossRepos
+ * for that installation with no signal anything was dropped -- record an audit event on the rare install where
+ * the limit is still hit, rather than pretending completeness this query can't actually guarantee unbounded. */
+async function listRepoFullNamesForInstallation(env: Env, installationId: number): Promise<string[]> {
+  const db = getDb(env.DB);
+  const rows = await db.select({ fullName: repositories.fullName }).from(repositories).where(eq(repositories.installationId, installationId)).limit(INSTALLATION_REPO_LIST_LIMIT);
+  if (rows.length === INSTALLATION_REPO_LIST_LIMIT) {
+    await recordAuditEvent(env, {
+      eventType: "agent.global_open_item_cap.repo_list_truncated",
+      actor: "gittensory",
+      targetKey: `installation:${installationId}`,
+      outcome: "error",
+      detail: `installation has >= ${INSTALLATION_REPO_LIST_LIMIT} repos; the global contributor-cap check may undercount repos not included here`,
+    }).catch(() => undefined);
+  }
+  return rows.map((row) => row.fullName);
+}
+
+/**
+ * Install-wide open-item count for one author (#2562, anti-abuse): SUM of this author's open PRs + open
+ * issues across every repo THIS INSTALLATION tracks. Same-database aggregate only -- no cross-instance
+ * networking, mirroring the install-scoped singleton shape of global_contributor_blacklist. Case-insensitive
+ * login match (mirrors loginMatches/findBlacklistEntry elsewhere in this file).
+ *
+ * Installation-scoped (regression fix): pullRequests/issues rows carry no installationId of their own, only
+ * repoFullName. The original version of this query filtered by authorLogin alone with no installation scoping
+ * at all, so on a D1 database shared by MULTIPLE installations (the hosted product's normal shape, and possible
+ * on self-host too -- the same App installed against more than one org/account) a contributor's open items on
+ * a DIFFERENT, unrelated installation would count toward (and could wrongly close a PR on) an install that
+ * never gated them on -- the exact cross-tenant leak install-scoped helpers elsewhere in this codebase (e.g.
+ * markRepositoriesRemovedFromInstallation) exist to avoid.
+ */
+export type OpenItemAcrossInstallRow = { repoFullName: string; number: number; kind: "pull_request" | "issue" };
+
+const AUTHOR_OPEN_ITEM_LIST_LIMIT = 20_000;
+
+/**
+ * Install-wide open-item ROWS for one author (#2562 gate-review follow-up), across every repo THIS
+ * INSTALLATION tracks. Returns the actual rows (not just a count) so the caller can LIVE-VERIFY each one
+ * before trusting the aggregate toward an irreversible close -- the stored DB cache can lag GitHub for a repo
+ * OTHER than the one the current webhook is for, and an inflated stale count must never itself trigger a
+ * close (mirrors the existing per-repo issue-cap's own sibling live-verification, #2479). Same-database
+ * aggregate only -- no cross-instance networking, mirroring the install-scoped singleton shape of
+ * global_contributor_blacklist. Case-insensitive login match (mirrors loginMatches/findBlacklistEntry
+ * elsewhere in this file).
+ */
+export async function listOpenItemsForAuthorAcrossInstall(env: Env, installationId: number, authorLogin: string): Promise<OpenItemAcrossInstallRow[]> {
+  const repoNames = await listRepoFullNamesForInstallation(env, installationId);
+  if (repoNames.length === 0) return [];
+  const db = getDb(env.DB);
+  const prRows = await db
+    .select({ repoFullName: pullRequests.repoFullName, number: pullRequests.number })
+    .from(pullRequests)
+    .where(and(eq(pullRequests.state, "open"), loginMatches(pullRequests.authorLogin, authorLogin), inArray(pullRequests.repoFullName, repoNames)))
+    .limit(AUTHOR_OPEN_ITEM_LIST_LIMIT);
+  if (prRows.length === AUTHOR_OPEN_ITEM_LIST_LIMIT) {
+    await recordAuditEvent(env, {
+      eventType: "agent.global_open_item_cap.author_items_truncated",
+      actor: "gittensory",
+      targetKey: `${authorLogin}@installation:${installationId}`,
+      outcome: "error",
+      detail: `author has >= ${AUTHOR_OPEN_ITEM_LIST_LIMIT} open pull requests across the install; the global contributor-cap check may undercount`,
+    }).catch(() => undefined);
+  }
+  const issueRows = await db
+    .select({ repoFullName: issues.repoFullName, number: issues.number })
+    .from(issues)
+    .where(and(eq(issues.state, "open"), loginMatches(issues.authorLogin, authorLogin), inArray(issues.repoFullName, repoNames)))
+    .limit(AUTHOR_OPEN_ITEM_LIST_LIMIT);
+  if (issueRows.length === AUTHOR_OPEN_ITEM_LIST_LIMIT) {
+    await recordAuditEvent(env, {
+      eventType: "agent.global_open_item_cap.author_items_truncated",
+      actor: "gittensory",
+      targetKey: `${authorLogin}@installation:${installationId}`,
+      outcome: "error",
+      detail: `author has >= ${AUTHOR_OPEN_ITEM_LIST_LIMIT} open issues across the install; the global contributor-cap check may undercount`,
+    }).catch(() => undefined);
+  }
+  return [
+    ...prRows.map((row) => ({ repoFullName: row.repoFullName, number: row.number, kind: "pull_request" as const })),
+    ...issueRows.map((row) => ({ repoFullName: row.repoFullName, number: row.number, kind: "issue" as const })),
+  ];
+}
+
 // Anti-farming (#anti-gaming-flood): how many PRs this author has SUBMITTED to this repo since `sinceIso` (ANY
 // state — open/merged/closed), so a flood that merges fast is still caught. createdAt is the row-insert time
 // (≈ when gittensory first saw the PR), a good proxy for submission time on live webhook-driven PRs.
@@ -3101,6 +3436,16 @@ export async function listOtherOpenPullRequests(env: Env, fullName: string, numb
     // drop the true winner on a repo with >100 open PRs and mis-elect a higher-numbered sibling. (#audit-3.9)
     .orderBy(asc(pullRequests.number))
     .limit(100);
+  return rows.map(toPullRequestRecordFromRow);
+}
+
+export async function listOtherOpenPullRequestsForAuthor(env: Env, fullName: string, number: number, authorLogin: string): Promise<PullRequestRecord[]> {
+  const db = getDb(env.DB);
+  const rows = await db
+    .select()
+    .from(pullRequests)
+    .where(and(eq(pullRequests.repoFullName, fullName), eq(pullRequests.state, "open"), not(eq(pullRequests.number, number)), sql`lower(${pullRequests.authorLogin}) = lower(${authorLogin})`))
+    .orderBy(asc(pullRequests.number));
   return rows.map(toPullRequestRecordFromRow);
 }
 
@@ -3511,7 +3856,14 @@ export async function persistAdvisory(env: Env, advisory: Advisory): Promise<voi
 
 /** #1 self-host AI-review cache. Returns the cached AI review for this exact (repo, pull, head SHA) ONLY when the
  *  stored review mode matches — the LLM output changes only with the code (head SHA) or the review mode, so a re-run
- *  at the same SHA+mode reuses it instead of re-spending the call. A nullish head SHA (no commit to key on) is a miss. */
+ *  at the same SHA+mode reuses it instead of re-spending the call. A nullish head SHA (no commit to key on) is a miss.
+ *
+ *  #regate-churn: a stored row can be non-cacheable (`cacheable = 0` — a consensus defect / inconclusive / lock-
+ *  contention outcome that must never be trusted as a durable, indefinitely-reusable verdict). By default such a
+ *  row is a miss here, same as before this column existed. Pass `options.allowNonCacheable` (with a bounded
+ *  `options.maxAgeMs`) to ALSO accept a non-cacheable row when it is recent enough — this lets a scheduled re-gate
+ *  reuse the last known (even disputed) verdict for a bounded cooldown instead of re-spending an LLM call on every
+ *  sweep tick, while a stale non-cacheable row still correctly falls through to a fresh call. */
 export async function getCachedAiReview(
   env: Env,
   repoFullName: string,
@@ -3519,13 +3871,19 @@ export async function getCachedAiReview(
   headSha: string | null | undefined,
   mode: string,
   expectedInputFingerprint?: string | undefined,
+  options?: { allowNonCacheable?: boolean; maxAgeMs?: number } | undefined,
 ): Promise<{ notes: string; reviewerCount: number; findings: AdvisoryFinding[]; metadata?: Record<string, unknown> | undefined } | null> {
   if (!headSha) return null;
   const row = await env.DB
-    .prepare("SELECT notes, reviewer_count AS reviewerCount, ai_review_mode AS mode, findings_json AS findingsJson, metadata_json AS metadataJson FROM ai_review_cache WHERE repo_full_name = ? AND pull_number = ? AND head_sha = ?")
+    .prepare("SELECT notes, reviewer_count AS reviewerCount, ai_review_mode AS mode, findings_json AS findingsJson, metadata_json AS metadataJson, cacheable, created_at AS createdAt FROM ai_review_cache WHERE repo_full_name = ? AND pull_number = ? AND head_sha = ?")
     .bind(repoFullName, pullNumber, headSha)
-    .first<{ notes: string; reviewerCount: number; mode: string; findingsJson: string | null; metadataJson: string | null }>();
+    .first<{ notes: string; reviewerCount: number; mode: string; findingsJson: string | null; metadataJson: string | null; cacheable: number; createdAt: string }>();
   if (!row || row.mode !== mode) return null;
+  if (row.cacheable !== 1) {
+    if (!options?.allowNonCacheable) return null;
+    const ageMs = Date.now() - Date.parse(row.createdAt);
+    if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > (options.maxAgeMs ?? 0)) return null;
+  }
   const metadata = parseJson<Record<string, unknown>>(row.metadataJson, {});
   if (
     expectedInputFingerprint !== undefined &&
@@ -3540,25 +3898,29 @@ export async function getCachedAiReview(
   };
 }
 
-/** Upsert the AI review for (repo, pull, head SHA). A nullish head SHA is a no-op. */
+/** Upsert the AI review for (repo, pull, head SHA). A nullish head SHA is a no-op.
+ *  #regate-churn: `review.cacheable === false` still PERSISTS the attempt (so a repeated scheduled sweep pass at
+ *  the identical head+fingerprint can find it via getCachedAiReview's bounded allowNonCacheable lookup) but marks
+ *  it non-durable — omitted or any other value defaults to cacheable (1), the pre-existing behavior. */
 export async function putCachedAiReview(
   env: Env,
   repoFullName: string,
   pullNumber: number,
   headSha: string | null | undefined,
   mode: string,
-  review: { notes: string; reviewerCount: number; findings?: AdvisoryFinding[]; metadata?: Record<string, unknown> | undefined },
+  review: { notes: string; reviewerCount: number; findings?: AdvisoryFinding[]; metadata?: Record<string, unknown> | undefined; cacheable?: boolean | undefined },
 ): Promise<void> {
   if (!headSha) return;
   const createdAt = nowIso();
+  const cacheable = review.cacheable === false ? 0 : 1;
   await env.DB
     .prepare(
-      `INSERT INTO ai_review_cache (repo_full_name, pull_number, head_sha, ai_review_mode, notes, reviewer_count, findings_json, metadata_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO ai_review_cache (repo_full_name, pull_number, head_sha, ai_review_mode, notes, reviewer_count, findings_json, metadata_json, cacheable, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(repo_full_name, pull_number, head_sha) DO UPDATE SET
-         ai_review_mode = excluded.ai_review_mode, notes = excluded.notes, reviewer_count = excluded.reviewer_count, findings_json = excluded.findings_json, metadata_json = excluded.metadata_json, created_at = excluded.created_at`,
+         ai_review_mode = excluded.ai_review_mode, notes = excluded.notes, reviewer_count = excluded.reviewer_count, findings_json = excluded.findings_json, metadata_json = excluded.metadata_json, cacheable = excluded.cacheable, created_at = excluded.created_at`,
     )
-    .bind(repoFullName, pullNumber, headSha, mode, review.notes, review.reviewerCount, jsonString(review.findings ?? []), jsonString(review.metadata ?? {}), createdAt)
+    .bind(repoFullName, pullNumber, headSha, mode, review.notes, review.reviewerCount, jsonString(review.findings ?? []), jsonString(review.metadata ?? {}), cacheable, createdAt)
     .run();
 }
 
@@ -3879,20 +4241,31 @@ export async function recordGateBlockOutcome(
     overridden: false,
     // blockedAt + updatedAt default to nowIso() via the schema `$defaultFn` on a fresh insert.
   };
+  // Null-safe, dialect-portable "head SHA unchanged" predicate. Preserve `overridden` ONLY when the head SHA
+  // is unchanged: a maintainer override applies to the exact commit it was granted on, so a NEW commit
+  // re-blocking must clear it — otherwise a one-time override would permanently disable the gate (and the
+  // draft-dodge auto-close) for every future push to the PR. (#audit-3.14)
+  //
+  // Build the predicate from the (build-time) value rather than SQLite's `head_sha IS <value>` operator:
+  // that operator is a hard parse error on the self-host Postgres backend (`head_sha IS $1`), and because the
+  // sole caller records this as best-effort telemetry (`.catch`), it silently threw away every gate_outcomes
+  // upsert there — killing the draft-dodge enforcement `getGateBlockOutcome` drives. Deriving the branch here
+  // also keeps the value out of an untyped `$n IS NULL` position (which Postgres rejects). Both dialects treat
+  // `col = ?` / `col IS NULL` identically, matching the original null-safe semantics on SQLite.
+  const headShaUnchanged =
+    values.headSha === null
+      ? sql`${gateOutcomes.headSha} IS NULL`
+      : sql`${gateOutcomes.headSha} = ${values.headSha}`;
   await getDb(env.DB)
     .insert(gateOutcomes)
     .values(values)
     .onConflictDoUpdate({
       target: [gateOutcomes.repoFullName, gateOutcomes.pullNumber],
-      // Refresh the codes/head/timestamp on a re-block. Preserve `overridden` ONLY when the head SHA is
-      // unchanged: a maintainer override applies to the exact commit it was granted on, so a NEW commit
-      // re-blocking must clear it — otherwise a one-time override would permanently disable the gate
-      // (and the draft-dodge auto-close) for every future push to the PR. (#audit-3.14)
       set: {
         headSha: values.headSha,
         blockerCodesJson: values.blockerCodesJson,
         updatedAt: nowIso(),
-        overridden: sql`CASE WHEN ${gateOutcomes.headSha} IS ${values.headSha} THEN ${gateOutcomes.overridden} ELSE 0 END`,
+        overridden: sql`CASE WHEN ${headShaUnchanged} THEN ${gateOutcomes.overridden} ELSE 0 END`,
       },
     });
 }
@@ -4095,6 +4468,7 @@ export async function upsertInstallationHealth(env: Env, health: InstallationHea
       eventsJson: jsonString(health.events),
       checkedAt: health.checkedAt,
       errorSummary: health.errorSummary ?? null,
+      authMode: health.authMode,
     })
     .onConflictDoUpdate({
       target: installationHealth.installationId,
@@ -4110,6 +4484,7 @@ export async function upsertInstallationHealth(env: Env, health: InstallationHea
         eventsJson: jsonString(health.events),
         checkedAt: health.checkedAt,
         errorSummary: health.errorSummary ?? null,
+        authMode: health.authMode,
       },
     });
 }
@@ -4849,6 +5224,7 @@ function toInstallationHealthRecord(row: typeof installationHealth.$inferSelect)
     events: parseJson<string[]>(row.eventsJson, []),
     checkedAt: row.checkedAt,
     errorSummary: row.errorSummary,
+    authMode: parseInstallationHealthAuthMode(row.authMode),
   };
 }
 
@@ -5778,6 +6154,14 @@ function parseCommandAuthorizationPolicy(value: string): RepositorySettings["com
   return normalizeCommandAuthorizationPolicy(parseJson<unknown>(value, null)).policy;
 }
 
+function parseTypeLabelSet(value: string): RepositorySettings["typeLabels"] {
+  return normalizeTypeLabelSet(parseJson<unknown>(value, null), []);
+}
+
+function parseLinkedIssueLabelPropagationConfig(value: string): RepositorySettings["linkedIssueLabelPropagation"] {
+  return normalizeLinkedIssueLabelPropagationConfig(parseJson<unknown>(value, null), []);
+}
+
 function parseContributorBlacklist(value: string): RepositorySettings["contributorBlacklist"] {
   return normalizeContributorBlacklist(parseJson<unknown>(value, null)).entries;
 }
@@ -5790,12 +6174,34 @@ function normalizeReviewNagPolicy(value: string | null | undefined): "off" | "ho
   return value === "hold" || value === "close" ? value : "off";
 }
 
+function normalizeCommandRateLimitPolicy(value: string | null | undefined): "off" | "hold" {
+  return value === "hold" ? value : "off";
+}
+
+function normalizeModerationGateMode(value: string | null | undefined): "inherit" | "off" | "enabled" {
+  return value === "off" || value === "enabled" ? value : "inherit";
+}
+
+// NULL means "inherit the global rule set" (undefined), distinct from a normalized-but-empty list -- a repo
+// that explicitly configured an empty moderationRules override (opting every rule out) must stay empty, not
+// be coerced back to "inherit". Mirrors parseContributorBlacklist/parseAutoCloseExemptLogins's JSON-parse
+// shape, except the column itself (not just malformed JSON) can be genuinely absent.
+function parseModerationRulesColumn(value: string | null | undefined): RepositorySettings["moderationRules"] {
+  if (value === null || value === undefined) return undefined;
+  return normalizeModerationRules(parseJson<unknown>(value, null)).rules;
+}
+
 // A review-nag threshold/window is a discrete positive count, not a score — reuses the same non-clamping,
 // non-rounding shape as contributorOpenPrCap's normalizeOpenItemCap (#2270): an invalid value (fractional,
 // non-positive, non-finite) falls back to the given default rather than being silently coerced.
 function normalizePositiveIntWithDefault(value: number | null | undefined, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) return fallback;
   return value;
+}
+
+function normalizeReviewNagCooldownDays(value: number | null | undefined, fallback: number): number {
+  const normalized = normalizePositiveIntWithDefault(value, fallback);
+  return Math.min(normalized, MAX_REVIEW_NAG_COOLDOWN_DAYS);
 }
 
 function parseAutonomyPolicy(value: string): AutonomyPolicy {
@@ -5881,6 +6287,10 @@ function parseCollisionRisk(value: string): CollisionEdgeRecord["risk"] {
 function parseInstallationHealthStatus(value: string): InstallationHealthRecord["status"] {
   if (value === "healthy" || value === "broken") return value;
   return "needs_attention";
+}
+
+function parseInstallationHealthAuthMode(value: string): InstallationHealthRecord["authMode"] {
+  return value === "broker" ? "broker" : "local";
 }
 
 function parseScoringSourceKind(value: string): ScoringModelSnapshotRecord["sourceKind"] {

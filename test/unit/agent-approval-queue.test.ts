@@ -59,6 +59,7 @@ import {
   listNotificationDeliveriesForRecipient,
   listPendingAgentActions,
   setPendingAgentActionStatus,
+  upsertGlobalContributorBlacklist,
   upsertInstallation,
   upsertPullRequestFromGitHub,
   upsertRepositorySettings,
@@ -75,7 +76,7 @@ function ctx(over: Partial<AgentActionExecutionContext> = {}): AgentActionExecut
     autonomy: { merge: "auto_with_approval" },
     agentPaused: false,
     agentDryRun: false,
-    installationPermissions: { pull_requests: "write", issues: "write" },
+    installationPermissions: { contents: "write", pull_requests: "write", issues: "write" },
     ...over,
   };
 }
@@ -88,7 +89,7 @@ async function seedInstallation(env: Env): Promise<void> {
       id: 5,
       account: { login: "owner", id: 1, type: "User" },
       repository_selection: "selected",
-      permissions: { metadata: "read", pull_requests: "write", issues: "write" },
+      permissions: { metadata: "read", contents: "write", pull_requests: "write", issues: "write" },
       events: ["pull_request"],
     },
     repositories: [{ name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }],
@@ -291,6 +292,23 @@ describe("agent approval queue (#779)", () => {
     expect(closeStillBlacklisted).toHaveBeenCalledWith(env, 5, "owner/repo", 7);
   });
 
+  it("REGRESSION: accept rechecks blacklist closes against the effective global blacklist", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: "x" });
+    await Promise.all([
+      upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { close: "auto_with_approval" }, contributorBlacklist: [] }),
+      upsertGlobalContributorBlacklist(env, { contributorBlacklist: [{ login: "fleet-banned", reason: "global" }] }),
+    ]);
+    await seedInstallation(env);
+    await upsertPullRequestFromGitHub(env, "owner/repo", { number: 7, title: "PR", state: "open", user: { login: "fleet-banned" }, head: { sha: "h7" }, labels: [], body: "x" });
+    const { action } = await createPendingAgentActionIfAbsent(env, { repoFullName: "owner/repo", pullNumber: 7, installationId: 5, actionClass: "close", autonomyLevel: "auto_with_approval", params: { closeComment: "blocked", closeKind: "blacklist", expectedHeadSha: "h7" }, reason: "blacklisted contributor" });
+
+    const result = await decidePendingAgentAction(env, { id: action.id, decision: "accept", decidedBy: "owner" });
+    expect(result.status).toBe("accepted");
+    expect(result.executionOutcome).toBe("completed");
+    const { closePullRequest: closeGloballyBlacklisted } = await import("../../src/github/pr-actions");
+    expect(closeGloballyBlacklisted).toHaveBeenCalledWith(env, 5, "owner/repo", 7);
+  });
+
   it("REGRESSION (#2452): accept supersedes a staged blacklist close when the contributor is NO LONGER blacklisted at accept time", async () => {
     // The head-SHA pin alone cannot catch this: the contributor never force-pushed, so the freshness check above
     // passes cleanly -- only re-resolving blacklist membership against the CURRENT repo settings (not the
@@ -393,7 +411,7 @@ describe("agent approval queue (#779)", () => {
     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: "x" });
     await upsertRepositorySettings(env, { repoFullName: "solorepo", autonomy: { close: "auto_with_approval" } });
     await upsertInstallation(env, {
-      installation: { id: 5, account: { login: "owner", id: 1, type: "User" }, repository_selection: "selected", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      installation: { id: 5, account: { login: "owner", id: 1, type: "User" }, repository_selection: "selected", permissions: { metadata: "read", contents: "write", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
       repositories: [{ name: "solorepo", full_name: "solorepo", private: false, owner: { login: "owner" } }],
     });
     await upsertPullRequestFromGitHub(env, "solorepo", { number: 7, title: "PR", state: "open", head: { sha: "h7" }, labels: [], body: "Closes #9" });
@@ -551,7 +569,7 @@ describe("agent approval queue (#779)", () => {
 
   it("accept downgrades a staged merge to a needs-human-review label when the precision breaker engaged after staging (#2127)", async () => {
     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: "x" });
-    await upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { merge: "auto_with_approval", label: "auto" } });
+    await upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { merge: "auto_with_approval", review_state_label: "auto" } });
     await seedInstallation(env);
     await upsertPullRequestFromGitHub(env, "owner/repo", { number: 7, title: "PR", state: "open", user: { login: "contributor" }, head: { sha: "h7" }, labels: [], body: "x" });
     const { action } = await createPendingAgentActionIfAbsent(env, { repoFullName: "owner/repo", pullNumber: 7, installationId: 5, actionClass: "merge", autonomyLevel: "auto_with_approval", params: { mergeMethod: "squash", expectedHeadSha: "h7" }, reason: "clean" });
@@ -570,7 +588,7 @@ describe("agent approval queue (#779)", () => {
     // breaker above would still get its whole row rejected on a stale linked-issue violation, silently swallowing
     // the hold label the breaker was supposed to guarantee.
     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: "x" });
-    await upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { merge: "auto_with_approval", label: "auto" } });
+    await upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { merge: "auto_with_approval", review_state_label: "auto" } });
     await seedInstallation(env);
     await upsertPullRequestFromGitHub(env, "owner/repo", { number: 7, title: "PR", state: "open", user: { login: "contributor" }, head: { sha: "h7" }, labels: [], body: "Closes #9" });
     vi.mocked(resolveLinkedIssueHardRule).mockResolvedValueOnce({ violated: true, reason: "Linked issue #9 is labeled `maintainer-only` — it is not open for community PRs." });
@@ -684,7 +702,7 @@ describe("agent approval queue (#779)", () => {
 
   it("accept downgrades a staged heuristic close to a needs-human-review label when the close breaker engaged (#2127)", async () => {
     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: "x" });
-    await upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { close: "auto_with_approval", label: "auto" } });
+    await upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { close: "auto_with_approval", review_state_label: "auto" } });
     await seedInstallation(env);
     await upsertPullRequestFromGitHub(env, "owner/repo", { number: 8, title: "PR", state: "open", user: { login: "contributor" }, head: { sha: "h8" }, labels: [], body: "x" });
     const { action } = await createPendingAgentActionIfAbsent(env, { repoFullName: "owner/repo", pullNumber: 8, installationId: 5, actionClass: "close", autonomyLevel: "auto_with_approval", params: { closeComment: "noise", closeKind: "heuristic", expectedHeadSha: "h8" }, reason: "ci-failed" });
@@ -769,7 +787,7 @@ describe("agent approval queue (#779)", () => {
     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: "x" });
     await upsertRepositorySettings(env, { repoFullName: "solorepo", autonomy: { merge: "auto_with_approval" } });
     await upsertInstallation(env, {
-      installation: { id: 5, account: { login: "owner", id: 1, type: "User" }, repository_selection: "selected", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      installation: { id: 5, account: { login: "owner", id: 1, type: "User" }, repository_selection: "selected", permissions: { metadata: "read", contents: "write", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
       repositories: [{ name: "solorepo", full_name: "solorepo", private: false, owner: { login: "owner" } }],
     });
     // No `user` on the payload → authorLogin stored null; repoFullName has no "/" → repoOwner falls back to "".

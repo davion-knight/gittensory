@@ -41,6 +41,23 @@ x-logging: &default-logging
       max-size: "10m"
       max-file: "3"
 
+# Self-hosted GitHub Actions runner temp env (#selfhost-runner-tmp): a container's plain /tmp lives in
+# Docker's overlay/containerd snapshot storage, NOT any mounted volume -- high-volume CI scratch writes
+# there (language toolchains, build caches, ad hoc `mktemp` calls) grow the HOST's Docker root storage
+# directly and are invisible to volume-scoped cleanup (confirmed in production: unbounded overlay growth,
+# disk pressure, and `docker system df` races against disappearing temp files). Every self-hosted-runner
+# service -- the `runner` service below, merged in via `<<: *runner-tmp-env`, AND any additional runner
+# service you add for a multi-runner deployment -- must point TMPDIR/TMP/TEMP at its own mounted
+# runner-work-style volume the same way, so job temp writes always land on mounted storage instead of the
+# container's writable layer. A second compose file (e.g. docker-compose.override.yml) CANNOT reference
+# this anchor directly -- YAML anchors don't cross files -- so an override adding another runner service
+# must redeclare this same x-runner-tmp-env block in its own file before merging it. See
+# docker-compose.override.yml.example and the self-hosting operations docs for the full pattern.
+x-runner-tmp-env: &runner-tmp-env
+  TMPDIR: /tmp/runner/tmp
+  TMP: /tmp/runner/tmp
+  TEMP: /tmp/runner/tmp
+
 services:
   # ── Core app (always runs) ─────────────────────────────────────────────────
   gittensory:
@@ -61,8 +78,10 @@ services:
       PORT: "8787"
       DATABASE_PATH: /data/gittensory.sqlite
       # Container-private per-repo config (#1390): point at a mounted dir holding {owner}__{repo}/.gittensory.yml
-      # files (and an optional root .gittensory.yml global fallback). Keeps each repo's policy OUT of the public
-      # GitHub repo so contributors can't game the rules. Empty/unmounted ⇒ repos use the public file / defaults.
+      # files layered over an optional root .gittensory.yml global default (a per-repo file overrides only the
+      # keys it sets; anything it doesn't mention is inherited from the global default — see
+      # config/examples/README.md). Keeps each repo's policy OUT of the public GitHub repo so contributors can't
+      # game the rules. Empty/unmounted ⇒ repos use the public file / defaults.
       GITTENSORY_REPO_CONFIG_DIR: "${GITTENSORY_REPO_CONFIG_DIR:-/config}"
       # Claude Code usage telemetry → OTEL collector → Prometheus → Claude usage dashboard. OFF unless you set
       # CLAUDE_CODE_ENABLE_TELEMETRY=1 in .env (requires --profile observability so the otel-collector is up).
@@ -96,7 +115,9 @@ services:
     volumes:
       - gittensory-data:/data
       # Container-private per-repo config dir (read-only). Create ./gittensory-config/{owner}__{repo}/.gittensory.yml
-      # locally (gitignored — never commit real policy). Absent ⇒ Docker mounts an empty dir ⇒ defaults apply.
+      # locally, optionally alongside a ./gittensory-config/.gittensory.yml global default that every per-repo file
+      # is deep-merged over (gitignored — never commit real policy; see config/examples/ for generic templates).
+      # Absent ⇒ Docker mounts an empty dir ⇒ defaults apply.
       - ./gittensory-config:/config:ro
     depends_on:
       redis:
@@ -605,12 +626,31 @@ services:
     network_mode: host # Tailscale needs host networking to advertise the host's address
 
   # ── Self-hosted GitHub Actions runner (--profile runners) ─────────────────
+  # NOT part of the default recommended stack -- purely optional. Three deployment modes (see .env.example
+  # for the full explanation): (1) app-only VPS + GitHub-hosted CI (recommended default, no runner here at
+  # all), (2) a separate dedicated runner host, (3) co-located runners on this SAME box (this profile).
   # Runs `runs-on: self-hosted` jobs on this machine. Set RUNNER_TOKEN= (or ACCESS_TOKEN=)
   # and RUNNER_REPO_URL= (e.g. https://github.com/your-org/your-repo) in .env.
   # Get a token at: https://github.com/<owner>/<repo>/settings/actions/runners/new
   # Running this alongside the main `gittensory` app on the SAME host? A burst of CI jobs can starve the
-  # app of CPU with no limits set (the default below). See docker-compose.override.yml.example for a
-  # proven CPU-priority pattern (relative cpu_shares + a per-container cpus ceiling) before scaling this up.
+  # app of CPU with no limits set (the default below) -- confirmed in production: 3 uncapped runner
+  # containers on an 8-vCPU box left the app starved under load. See docker-compose.override.yml.example
+  # for a proven CPU-priority pattern (relative cpu_shares + a per-container cpus ceiling) before scaling
+  # this up, and ./scripts/selfhost-docker-prune.sh for reclaiming the disk space CI builds accumulate.
+  # One-shot bootstrap for the runner's TMPDIR (below): guarantees /tmp/runner/tmp exists (and is
+  # world-writable, matching real /tmp's mode -- the runner image's runtime user isn't guaranteed to be
+  # root) on the runner-work volume BEFORE the runner container starts. A fresh named volume has nothing
+  # at that path otherwise, and pointing TMPDIR at a directory that doesn't exist yet would break every
+  # job step that shells out expecting $TMPDIR to be usable. `mkdir -p` is idempotent, so this safely
+  # no-ops on every subsequent `docker compose up`; it never touches the runner image's own entrypoint.
+  runner-tmp-init:
+    image: alpine:3.20
+    <<: *default-logging
+    profiles: ["runners"]
+    volumes:
+      - runner-work:/tmp/runner
+    command: ["sh", "-c", "mkdir -p /tmp/runner/tmp && chmod 1777 /tmp/runner/tmp"]
+
   runner:
     # Pin to a specific version tag — `latest` is mutable. Find a digest via:
     # docker pull myoung34/github-runner:ubuntu-jammy && docker inspect --format='{{index .RepoDigests 0}}' myoung34/github-runner:ubuntu-jammy
@@ -618,7 +658,11 @@ services:
     restart: unless-stopped
     <<: *default-logging
     profiles: ["runners"]
+    depends_on:
+      runner-tmp-init:
+        condition: service_completed_successfully
     environment:
+      <<: *runner-tmp-env
       RUNNER_SCOPE: ${RUNNER_SCOPE:-repo}
       REPO_URL: ${RUNNER_REPO_URL:-}
       RUNNER_TOKEN: ${RUNNER_TOKEN:-}

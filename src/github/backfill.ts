@@ -26,6 +26,7 @@ import {
   upsertContributor,
   upsertContributorRepoStat,
   upsertInstallationHealth,
+  getInstallationHealth,
   upsertIssueFromGitHub,
   upsertPullRequestFile,
   upsertPullRequestDetailSyncState,
@@ -37,10 +38,11 @@ import {
   upsertRepoSyncSegment,
   upsertRepoSyncState,
   upsertRepositoryFromGitHub,
+  updateInstallationPermissions,
   persistRepoSnapshot,
   extractLinkedIssueNumbers,
 } from "../db/repositories";
-import { agentRequiresPrWrite } from "../settings/agent-execution";
+import { agentRequiresContentsWrite, agentRequiresPrWrite } from "../settings/agent-execution";
 import type {
   ContributorRepoStatRecord,
   GitHubRateLimitObservationRecord,
@@ -78,6 +80,7 @@ import {
 } from "./client";
 import { fetchCachedGitHubGraphQl } from "./graphql-cache";
 import { incr } from "../selfhost/metrics";
+import { fetchBrokeredInstallationToken, isOrbBrokerMode } from "../orb/broker-client";
 type GitHubLabelPayload = {
   name: string;
   color?: string;
@@ -325,6 +328,12 @@ const PR_DETAIL_BATCH_SIZE: Record<BackfillMode, number> = { light: 12, full: 40
 // runs again (#audit-rate-headroom). Any PR left un-hydrated this run stays a candidate on the next page/run.
 const MERGED_PR_FILE_HYDRATION_BATCH_SIZE: Record<BackfillMode, number> = { light: 10, full: 20, resume: 20 };
 const PULL_REQUEST_FILES_FETCH_METRIC = "gittensory_github_pull_request_files_fetch_total";
+// #selfhost-runtime-pressure: a bare 403 on the branch-protection probe (no admin:read on this installation/fork,
+// the common case) is a PERMISSION/config gap, not GitHub rate-limit exhaustion -- GitHubApiError.rateLimited
+// already makes that distinction (see isRateLimitedGitHubFailure below). Counted separately from the rate-limit
+// metrics so a dashboard can tell "GitHub is throttling us" apart from "this token can't read branch protection
+// (expected for most installations/forks)" instead of a permission gap inflating an apparent rate-limit signal.
+const BRANCH_PROTECTION_PERMISSION_DENIED_METRIC = "gittensory_github_branch_protection_permission_denied_total";
 type PullRequestFilesFetchCaller = "backfill_open_pr_details" | "backfill_merged_history" | "live_review";
 // #2537: durable-cache counter for the bare PR-state read, mirroring PULL_REQUEST_FILES_FETCH_METRIC's bounded-
 // label style (no per-PR-number labels — cardinality-safe).
@@ -619,15 +628,15 @@ export async function backfillOpenPullRequestDetails(
   await mapWithConcurrency(batch, 2, async (pr) => {
     await upsertPullRequestDetailSyncState(env, { repoFullName: repo.fullName, pullNumber: pr.number, status: "running" });
     const before = warnings.length;
-    const { reviewsSyncedAt } = await fetchAndStorePullRequestDetails(env, repo.fullName, pr, token, warnings, admissionKey, "backfill_open_pr_details");
+    const { headSha, filesSyncedAt, reviewsSyncedAt } = await fetchAndStorePullRequestDetails(env, repo.fullName, pr, token, warnings, admissionKey, "backfill_open_pr_details");
     const syncedAt = nowIso();
     const newWarnings = warnings.slice(before);
     await upsertPullRequestDetailSyncState(env, {
       repoFullName: repo.fullName,
       pullNumber: pr.number,
       status: newWarnings.length > 0 ? "partial" : "complete",
-      headSha: pr.headSha,
-      filesSyncedAt: syncedAt,
+      headSha,
+      filesSyncedAt,
       reviewsSyncedAt,
       checksSyncedAt: syncedAt,
       lastSyncedAt: syncedAt,
@@ -695,15 +704,15 @@ export async function refreshPullRequestDetails(
   const admissionKey = repoAdmissionKeyForToken(env, repo, token);
   const warnings: string[] = [];
   await upsertPullRequestDetailSyncState(env, { repoFullName, pullNumber, status: "running" });
-  const { reviewsSyncedAt } = await fetchAndStorePullRequestDetails(env, repoFullName, pr, token, warnings, admissionKey, "live_review", { forceFiles: options.force });
+  const { headSha, filesSyncedAt, reviewsSyncedAt } = await fetchAndStorePullRequestDetails(env, repoFullName, pr, token, warnings, admissionKey, "live_review", { forceFiles: options.force });
   const syncedAt = nowIso();
   const status: PullRequestDetailSyncStateRecord["status"] = warnings.length > 0 ? "partial" : "complete";
   await upsertPullRequestDetailSyncState(env, {
     repoFullName,
     pullNumber,
     status,
-    headSha: pr.headSha,
-    filesSyncedAt: syncedAt,
+    headSha,
+    filesSyncedAt,
     reviewsSyncedAt,
     checksSyncedAt: syncedAt,
     lastSyncedAt: syncedAt,
@@ -820,12 +829,15 @@ export const OPTIONAL_CHECK_RUN_PERMISSION: Record<string, string> = {
 export const OPTIONAL_PR_WRITE_PERMISSION: Record<string, string> = {
   pull_requests: "write",
 };
+export const OPTIONAL_CONTENTS_WRITE_PERMISSION: Record<string, string> = {
+  contents: "write",
+};
 
 export const REQUIRED_INSTALLATION_EVENTS = ["issues", "issue_comment", "pull_request", "repository"] as const;
 export const OPTIONAL_VISIBLE_INSTALLATION_EVENTS = ["installation_target", "installation_repositories"] as const;
 
 type InstallationModeImpact = {
-  mode: "comment" | "label" | "check_run" | "gate_check";
+  mode: "comment" | "label" | "check_run" | "gate_check" | "agent_pr_action" | "agent_merge";
   enabled: boolean;
   affectedRepoCount: number;
   requiredPermissions: Array<{ permission: string; requiredAccess: string; missing: boolean; optional: boolean }>;
@@ -841,7 +853,52 @@ type InstallationEventDiagnostic = {
   action: string;
 };
 
+// Broker mode (#selfhost-runtime-drift): a brokered self-host holds no local GitHub App private key by design.
+// Permissions can be refreshed from the broker token response when available; event subscriptions still cannot be
+// introspected through the broker, so the remediation text must keep that distinction explicit.
+function enrichBrokerInstallationHealth(health: InstallationHealthRecord) {
+  const brokerHealthy = health.status === "healthy";
+  const missingPermissions = new Set(health.missingPermissions);
+  const requiredPermissions = {
+    ...REQUIRED_INSTALLATION_PERMISSIONS,
+    ...(missingPermissions.has("checks") ? OPTIONAL_CHECK_RUN_PERMISSION : {}),
+    ...(missingPermissions.has("pull_requests") && permissionSatisfies(health.permissions.pull_requests, "read") ? OPTIONAL_PR_WRITE_PERMISSION : {}),
+    ...(missingPermissions.has("contents") ? OPTIONAL_CONTENTS_WRITE_PERMISSION : {}),
+  };
+  return {
+    ...health,
+    requiredPermissions,
+    optionalPermissions: OPTIONAL_CHECK_RUN_PERMISSION,
+    requiredEvents: [...REQUIRED_INSTALLATION_EVENTS],
+    optionalVisibleEvents: [...OPTIONAL_VISIBLE_INSTALLATION_EVENTS],
+    permissionRemediation: Object.entries(requiredPermissions).map(([permission, access]) => ({
+      permission,
+      requiredAccess: access,
+      currentAccess: health.permissions[permission] ?? "unavailable_in_broker_mode",
+      ok: !missingPermissions.has(permission) && Boolean(health.permissions[permission]),
+      action: missingPermissions.has(permission) ? `Set repository permission ${permission} to ${access}.` : "No change needed.",
+    })),
+    eventRemediation: REQUIRED_INSTALLATION_EVENTS.map((event) => ({
+      event,
+      ok: false,
+      action: "Event-subscription introspection is unavailable in broker mode.",
+    })),
+    repairSteps: brokerHealthy
+      ? [
+          "This is a brokered self-host (Orb token broker mode) -- it holds no local GitHub App private key by design.",
+          "The token broker is reachable and minting installation tokens normally.",
+          "Permission grants were refreshed from the broker token response when GitHub provided them; event-subscription introspection is unavailable in broker mode.",
+        ]
+      : [
+          "This is a brokered self-host (Orb token broker mode) -- it holds no local GitHub App private key by design.",
+          `The token broker is unreachable or failing to mint installation tokens${health.errorSummary ? `: ${health.errorSummary}` : "."}`,
+          "Check ORB_ENROLLMENT_SECRET / ORB_BROKER_URL and the central Orb's availability, then re-run refresh-installation-health.",
+        ],
+  };
+}
+
 export function enrichInstallationHealth(health: InstallationHealthRecord) {
+  if (health.authMode === "broker") return enrichBrokerInstallationHealth(health);
   const missingPermissions = new Set(health.missingPermissions);
   const requiredEventSet = new Set<string>(REQUIRED_INSTALLATION_EVENTS);
   const normalizedMissingEvents = health.missingEvents.filter((event) => requiredEventSet.has(event));
@@ -856,6 +913,7 @@ export function enrichInstallationHealth(health: InstallationHealthRecord) {
     // Persisted health stores only the missing permission name. If pull_requests is already granted at read level,
     // a missing pull_requests entry can only mean an acting autonomy needs write; otherwise preserve baseline read.
     ...(missingPermissions.has("pull_requests") && permissionSatisfies(health.permissions.pull_requests, "read") ? OPTIONAL_PR_WRITE_PERMISSION : {}),
+    ...(missingPermissions.has("contents") ? OPTIONAL_CONTENTS_WRITE_PERMISSION : {}),
   };
   return {
     ...health,
@@ -896,14 +954,16 @@ export async function buildInstallationRepairDiagnostics(env: Env, health: Insta
   const labelRepoCount = installedSettings.filter(usesLabelMode).length;
   const checkRunRepoCount = installedSettings.filter((settings) => settings.checkRunMode === "enabled").length;
   const gateCheckRepoCount = installedSettings.filter((settings) => settings.gateCheckMode === "enabled").length;
-  const requiresPrWrite = installedSettings.some((settings) => agentRequiresPrWrite(settings.autonomy));
+  const prWriteRepoCount = installedSettings.filter((settings) => agentRequiresPrWrite(settings.autonomy)).length;
+  const mergeRepoCount = installedSettings.filter((settings) => agentRequiresContentsWrite(settings.autonomy)).length;
   const missingPermissions = new Set(health.missingPermissions);
   const requiredEventSet = new Set<string>(REQUIRED_INSTALLATION_EVENTS);
   const missingEvents = new Set(health.missingEvents.filter((event) => requiredEventSet.has(event)));
   const requiredPermissions = {
     ...REQUIRED_INSTALLATION_PERMISSIONS,
     ...(checkRunRepoCount > 0 || gateCheckRepoCount > 0 ? OPTIONAL_CHECK_RUN_PERMISSION : {}),
-    ...(requiresPrWrite ? OPTIONAL_PR_WRITE_PERMISSION : {}), // acting autonomy → pull_requests:write (#audit-install-health)
+    ...(prWriteRepoCount > 0 ? OPTIONAL_PR_WRITE_PERMISSION : {}),
+    ...(mergeRepoCount > 0 ? OPTIONAL_CONTENTS_WRITE_PERMISSION : {}),
   };
   const optionalPermissions = checkRunRepoCount > 0 || gateCheckRepoCount > 0 ? {} : OPTIONAL_CHECK_RUN_PERMISSION;
   const modeImpacts: InstallationModeImpact[] = [
@@ -950,6 +1010,32 @@ export async function buildInstallationRepairDiagnostics(env: Env, health: Insta
         gateCheckRepoCount > 0
           ? "Review-agent check mode is enabled for at least one installed repo, so Checks: write is required."
           : "Checks: write is optional unless review-agent check mode is enabled for an installed repo.",
+    }),
+    buildPermissionModeImpact({
+      mode: "agent_pr_action",
+      enabled: prWriteRepoCount > 0,
+      affectedRepoCount: prWriteRepoCount,
+      permission: "pull_requests",
+      requiredAccess: "write",
+      missing: prWriteRepoCount > 0 && missingPermissions.has("pull_requests"),
+      optional: prWriteRepoCount === 0,
+      summary:
+        prWriteRepoCount > 0
+          ? "Auto-maintain PR review, close, and update-branch actions are enabled for at least one installed repo, so Pull requests: write is required."
+          : "Pull requests: write is optional unless PR-state auto-maintain actions are enabled for an installed repo.",
+    }),
+    buildPermissionModeImpact({
+      mode: "agent_merge",
+      enabled: mergeRepoCount > 0,
+      affectedRepoCount: mergeRepoCount,
+      permission: "contents",
+      requiredAccess: "write",
+      missing: mergeRepoCount > 0 && missingPermissions.has("contents"),
+      optional: mergeRepoCount === 0,
+      summary:
+        mergeRepoCount > 0
+          ? "Auto-merge is enabled for at least one installed repo, so Contents: write is required by GitHub's merge endpoint."
+          : "Contents: write is optional unless auto-merge is enabled for an installed repo.",
     }),
   ];
   const eventDiagnostics: InstallationEventDiagnostic[] = [
@@ -1058,18 +1144,62 @@ export async function refreshInstallationHealthForInstallation(env: Env, install
 async function refreshInstallationHealthRecords(env: Env, installations: InstallationRecord[], repositories: RepositoryRecord[]) {
   const health = [];
   for (const installation of installations) {
-    const { installation: currentInstallation, errorSummary } = await refreshStoredInstallation(env, installation);
+    const { installation: currentInstallation, errorSummary, authMode } = await refreshStoredInstallation(env, installation);
     const installedRepos = repositories.filter((repo) => repo.installationId === currentInstallation.id && repo.isInstalled);
     const registeredInstalled = installedRepos.filter((repo) => repo.isRegistered);
     const installedSettings = await Promise.all(installedRepos.map((repo) => getRepositorySettings(env, repo.fullName)));
     const requiresChecks = installedSettings.some((settings) => settings.checkRunMode === "enabled");
     const requiresPrWrite = installedSettings.some((settings) => agentRequiresPrWrite(settings.autonomy));
+    const requiresContentsWrite = installedSettings.some((settings) => agentRequiresContentsWrite(settings.autonomy));
     const requiredPermissions = {
       ...REQUIRED_INSTALLATION_PERMISSIONS,
       ...(requiresChecks ? OPTIONAL_CHECK_RUN_PERMISSION : {}),
       // An acting autonomy upgrades the pull_requests requirement read -> write (spread last so it wins). (#audit-install-health)
       ...(requiresPrWrite ? OPTIONAL_PR_WRITE_PERMISSION : {}),
+      ...(requiresContentsWrite ? OPTIONAL_CONTENTS_WRITE_PERMISSION : {}),
     };
+
+    // Broker mode (#selfhost-runtime-drift): the token broker can now expose the permission snapshot attached to
+    // the minted installation token, but it still cannot expose webhook event subscriptions. Recompute permission
+    // gaps when a broker snapshot is present; keep event gaps from the previous verified record instead of
+    // fabricating a clean event bill of health.
+    //
+    // Persistence (#selfhost-runtime-drift follow-up): writing missingPermissions/missingEvents as [] here reads,
+    // to any OTHER consumer of InstallationHealthRecord that predates broker mode and doesn't branch on authMode
+    // (e.g. registration-readiness / settings-preview warnings), as "verified, nothing missing" -- indistinguishable
+    // from a real local-mode clean bill of health. "No data to compute a diff from" is not the same claim as
+    // "confirmed zero missing", so carry forward whatever was last persisted (from an earlier local-mode refresh,
+    // or an earlier broker probe) instead of stomping it with a fabricated-clean []. A row with no prior record at
+    // all has never been verified either way, so [] is the only honest starting point.
+    if (authMode === "broker") {
+      const previous = await getInstallationHealth(env, currentInstallation.id);
+      const hasBrokerPermissionSnapshot = Object.keys(currentInstallation.permissions).length > 0;
+      const missingPermissions = hasBrokerPermissionSnapshot
+        ? Object.entries(requiredPermissions)
+            .filter(([permission, expected]) => !permissionSatisfies(currentInstallation.permissions[permission], expected))
+            .map(([permission]) => permission)
+        : (previous?.missingPermissions ?? ([] as string[]));
+      const missingEvents = previous?.missingEvents ?? ([] as string[]);
+      const record = {
+        installationId: currentInstallation.id,
+        accountLogin: currentInstallation.accountLogin,
+        repositorySelection: currentInstallation.repositorySelection,
+        installedReposCount: installedRepos.length,
+        registeredInstalledCount: registeredInstalled.length,
+        status: errorSummary || missingPermissions.length > 0 || missingEvents.length > 0 ? ("needs_attention" as const) : ("healthy" as const),
+        missingPermissions,
+        missingEvents,
+        permissions: currentInstallation.permissions,
+        events: currentInstallation.events,
+        checkedAt: nowIso(),
+        errorSummary,
+        authMode,
+      } as const;
+      await upsertInstallationHealth(env, record);
+      health.push(enrichInstallationHealth(record));
+      continue;
+    }
+
     const missingPermissions = Object.entries(requiredPermissions)
       .filter(([permission, expected]) => !permissionSatisfies(currentInstallation.permissions[permission], expected))
       .map(([permission]) => permission);
@@ -1088,6 +1218,7 @@ async function refreshInstallationHealthRecords(env: Env, installations: Install
       events: currentInstallation.events,
       checkedAt: nowIso(),
       errorSummary,
+      authMode,
     } as const;
     await upsertInstallationHealth(env, record);
     health.push(enrichInstallationHealth(record));
@@ -1095,7 +1226,52 @@ async function refreshInstallationHealthRecords(env: Env, installations: Install
   return { ok: true, installations: health };
 }
 
-async function refreshStoredInstallation(env: Env, installation: InstallationRecord): Promise<{ installation: InstallationRecord; errorSummary?: string }> {
+/** Local App-key mode: refresh permissions/events from GitHub via the App's own JWT (unchanged). Broker mode
+ *  (#selfhost-runtime-drift): a brokered self-host holds no local App private key by design, so calling
+ *  getAppInstallation would always throw "GitHub App credentials are not configured" -- correct for local mode,
+ *  misleading here. Instead confirm the ONE thing broker mode can actually check today: whether the token broker
+ *  mints an installation token. currentInstallation.permissions/events are left untouched (there is nothing to
+ *  refresh them from), so callers must key off authMode rather than treating an empty missingPermissions as a
+ *  clean bill of health the way they would for local mode. */
+async function refreshStoredInstallation(
+  env: Env,
+  installation: InstallationRecord,
+): Promise<{ installation: InstallationRecord; errorSummary?: string; authMode: InstallationHealthRecord["authMode"] }> {
+  if (isOrbBrokerMode(env)) {
+    try {
+      const minted = await fetchBrokeredInstallationToken(env);
+      // A brokered self-host is bound to exactly ONE real installation, but the local DB can carry
+      // multiple installation rows (e.g. a stale row left over from a prior re-registration). The mint
+      // call takes no installationId -- it always returns "the" broker-bound token -- so a successful
+      // mint here only proves the broker is reachable, never that it is bound to THIS row. Compare the
+      // minted token's own installationId (parsed from the broker's response payload) against the row
+      // being probed; a mismatch (or a missing/zero id from an older broker) must not be reported healthy.
+      if (minted.installationId === 0 || minted.installationId !== installation.id) {
+        incr("gittensory_installation_health_broker_probe_total", { result: "mismatched_installation" });
+        return {
+          installation,
+          errorSummary: `Token broker minted a token for installation ${minted.installationId || "unknown"}, not ${installation.id}.`,
+          authMode: "broker",
+        };
+      }
+      const refreshedInstallation =
+        minted.permissions && Object.keys(minted.permissions).length > 0
+          ? { ...installation, permissions: minted.permissions, updatedAt: nowIso() }
+          : installation;
+      if (refreshedInstallation !== installation) {
+        await updateInstallationPermissions(env, installation.id, refreshedInstallation.permissions);
+      }
+      incr("gittensory_installation_health_broker_probe_total", { result: "ok" });
+      return { installation: refreshedInstallation, authMode: "broker" };
+    } catch (error) {
+      incr("gittensory_installation_health_broker_probe_total", { result: "failed" });
+      return {
+        installation,
+        errorSummary: strippedErrorMessage(error, "Token broker did not mint an installation token."),
+        authMode: "broker",
+      };
+    }
+  }
   try {
     const live = await getAppInstallation(env, installation.id);
     await upsertInstallation(env, { installation: live });
@@ -1111,11 +1287,13 @@ async function refreshStoredInstallation(env: Env, installation: InstallationRec
         suspendedAt: live.suspended_at ?? undefined,
         updatedAt: nowIso(),
       },
+      authMode: "local",
     };
   } catch (error) {
     return {
       installation,
       errorSummary: strippedErrorMessage(error, "Failed to refresh GitHub App installation metadata."),
+      authMode: "local",
     };
   }
 }
@@ -1813,7 +1991,7 @@ async function backfillRepository(env: Env, repo: RepositoryRecord, limits: Back
     const detailWarningStart = warnings.length;
     await mapWithConcurrency(detailTargets, limits.detailConcurrency, async (pr) => {
       const before = warnings.length;
-      const { reviewsSyncedAt } = await fetchAndStorePullRequestDetails(env, repo.fullName, pr, token, warnings, admissionKey, "backfill_open_pr_details");
+      const { headSha, filesSyncedAt, reviewsSyncedAt } = await fetchAndStorePullRequestDetails(env, repo.fullName, pr, token, warnings, admissionKey, "backfill_open_pr_details");
       // Persist the repo+PR+headSha snapshot marker (#audit-rate-headroom) so a later call through ANY
       // cache-aware path (open-PR convergence, live review) can skip refetching this PR's files while its
       // head is unchanged — without this write, fetchAndStorePullRequestDetails's cache check always misses
@@ -1824,8 +2002,8 @@ async function backfillRepository(env: Env, repo: RepositoryRecord, limits: Back
         repoFullName: repo.fullName,
         pullNumber: pr.number,
         status: newWarnings.length > 0 ? "partial" : "complete",
-        headSha: pr.headSha,
-        filesSyncedAt: syncedAt,
+        headSha,
+        filesSyncedAt,
         reviewsSyncedAt,
         checksSyncedAt: syncedAt,
         lastSyncedAt: syncedAt,
@@ -1975,6 +2153,35 @@ async function backfillRepository(env: Env, repo: RepositoryRecord, limits: Back
   }
 }
 
+// Bounded-age backstop (#2537 second gate pass): the reviewsInvalidatedAt comparison below is EXACT when the
+// invalidation write actually happens, but a silently DROPPED markPullRequestReviewsInvalidated write leaves
+// reviewsInvalidatedAt null forever -- there is then no marker at all to compare against, so the exact
+// comparison alone would read "up to date" indefinitely no matter how long ago reviewsSyncedAt was. This is the
+// only backstop for a signal that was never recorded in the first place; deliberately long so a
+// normally-behaving PR (invalidation writes succeeding) never hits it in practice.
+const REVIEWS_CACHE_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+
+// #2537 follow-up (gate-flagged): a small, pure predicate mirroring fetchAndStorePullRequestDetails's own
+// reviewsUpToDate check below, exported so the periodic re-gate sweep (queue/processors.ts) can independently
+// decide whether a stale reviews cache is, on its own, a reason to force a refresh -- otherwise this row's
+// invalidation state only gets EVALUATED when something ELSE already calls refreshPullRequestDetails, which a
+// "quiet" PR (no new pushes, slop evidence + manifest gate both off, no pre-merge check paths) may never do. A
+// SINGLE authoritative definition (this function) rather than two independently-maintained copies that could
+// drift -- both the exact invalidation-marker comparison AND the bounded-age fallback live here, so a caller
+// that only checks THIS predicate (e.g. the sweep, before deciding whether to even call refreshPullRequestDetails)
+// agrees with fetchAndStorePullRequestDetails's own internal check once that call actually happens.
+export function isReviewsCacheUpToDate(
+  syncState: Pick<PullRequestDetailSyncStateRecord, "reviewsSyncedAt" | "reviewsInvalidatedAt"> | null | undefined,
+): boolean {
+  const reviewsSyncedAt = syncState?.reviewsSyncedAt;
+  if (!reviewsSyncedAt) return false;
+  const invalidationCleared = !syncState?.reviewsInvalidatedAt || reviewsSyncedAt > syncState.reviewsInvalidatedAt;
+  if (!invalidationCleared) return false;
+  const reviewsSyncedAtMs = Date.parse(reviewsSyncedAt);
+  if (!Number.isFinite(reviewsSyncedAtMs)) return false;
+  return Date.now() - reviewsSyncedAtMs < REVIEWS_CACHE_MAX_AGE_MS;
+}
+
 async function fetchAndStorePullRequestDetails(
   env: Env,
   repoFullName: string,
@@ -1984,7 +2191,7 @@ async function fetchAndStorePullRequestDetails(
   admissionKey: GitHubRateLimitAdmissionKey | undefined,
   caller: PullRequestFilesFetchCaller,
   options: { forceFiles?: boolean | undefined } = {},
-): Promise<{ reviewsSyncedAt: string | null | undefined }> {
+): Promise<{ headSha: string | null | undefined; filesSyncedAt: string | null | undefined; reviewsSyncedAt: string | null | undefined }> {
   // Durable repo+PR+headSha file snapshot (#audit-rate-headroom): a bare URL cache is insufficient because
   // `/pulls/{n}/files` has the SAME url across different heads. Reuse the stored `pull_request_files` rows
   // instead of refetching when the last successful files sync already covered the PR's CURRENT head SHA —
@@ -2006,10 +2213,8 @@ async function fetchAndStorePullRequestDetails(
   // >=): millisecond-resolution ISO timestamps can tie when a sync and a racing invalidation land in the same
   // millisecond, and sub-millisecond ordering is unknowable from the stored strings — a tie must fail toward
   // "still needs a refetch," never toward silently trusting a possibly-stale cache.
-  const reviewsSyncedAtBefore = existingState?.reviewsSyncedAt;
-  const reviewsUpToDate =
-    Boolean(reviewsSyncedAtBefore) &&
-    (!existingState?.reviewsInvalidatedAt || (reviewsSyncedAtBefore ?? "") > existingState.reviewsInvalidatedAt);
+  const reviewsUpToDate = isReviewsCacheUpToDate(existingState);
+  const fileFetchStartedAt = nowIso();
   // Gate review finding (TOCTOU race): `existingState` above is a snapshot read at the TOP of this call. If a
   // `pull_request_review` webhook races in AFTER that read but BEFORE this function returns, an unconditional
   // "stamp reviewsSyncedAt to now" on the CALLER's side (the old design) would advance the timestamp PAST that
@@ -2025,13 +2230,27 @@ async function fetchAndStorePullRequestDetails(
     fetchPullRequestChecks(env, repoFullName, pr, token, warnings, admissionKey),
   ]);
   const fileSyncFailed = warnings.slice(warningStart).some((warning) => warning.startsWith(`File sync failed for #${pr.number}:`));
+  // A filesSyncedAt/headSha pair means "the stored pull_request_files rows are a confirmed snapshot for
+  // this exact head." On a cache-hit skip or a failed refetch we did not advance the stored files, so we must
+  // not advance the marker either -- BUT we must also not *replay* the snapshot we read at the top of this
+  // call. `existingState` is a TOCTOU read: if a DIFFERENT concurrent call for the same PR successfully syncs
+  // to an even newer head between that read and this call's own persist, re-writing our stale snapshot here
+  // would regress the durable marker backward and clobber the newer, correct value the concurrent call just
+  // wrote (gate review finding). `upsertPullRequestDetailSyncState` treats an `undefined` field as "leave this
+  // column unchanged" (see its PARTIAL-UPDATE CONTRACT comment) -- so returning `undefined` instead of the
+  // snapshot tells every caller's upsert to skip the column entirely, which is safe whether the row is still
+  // exactly what we read or has since moved on: either way we simply don't touch it.
+  const headShaResult = filesUpToDate || fileSyncFailed ? undefined : pr.headSha;
+  const filesSyncedAtResult = filesUpToDate || fileSyncFailed ? undefined : fileFetchStartedAt;
   // reviewsSyncedAt only ever ADVANCES on a genuine success in THIS call -- never on a cache-hit skip, and
   // never on a failed fetch attempt. This is what makes a stored reviewsSyncedAt a trustworthy "last confirmed
   // successful sync" marker on its own (no separate errorSummary string-matching needed: a failed or skipped
-  // pass simply preserves whatever was already known, which -- being unchanged -- correctly keeps comparing as
-  // stale against reviewsInvalidatedAt on the next pass until a real fetch actually succeeds).
+  // pass simply leaves whatever was already known untouched, which -- being unchanged -- correctly keeps
+  // comparing as stale against reviewsInvalidatedAt on the next pass until a real fetch actually succeeds).
+  // Same TOCTOU hazard as headSha/filesSyncedAt above: `undefined` (not the pre-fetch `existingState`
+  // snapshot) so a skipped/failed pass never regresses a marker a concurrent call has since advanced.
   const reviewSyncFailedThisCall = !reviewsUpToDate && warnings.slice(warningStart).some((warning) => warning.startsWith(`Review sync failed for #${pr.number}:`));
-  const reviewsSyncedAtResult = !reviewsUpToDate && !reviewSyncFailedThisCall ? reviewFetchStartedAt : reviewsSyncedAtBefore;
+  const reviewsSyncedAtResult = !reviewsUpToDate && !reviewSyncFailedThisCall ? reviewFetchStartedAt : undefined;
 
   if (!filesUpToDate && !fileSyncFailed) {
     await deletePullRequestFiles(env, repoFullName, pr.number);
@@ -2076,7 +2295,7 @@ async function fetchAndStorePullRequestDetails(
       payload: check as unknown as Record<string, JsonValue>,
     });
   }
-  return { reviewsSyncedAt: reviewsSyncedAtResult };
+  return { headSha: headShaResult, filesSyncedAt: filesSyncedAtResult, reviewsSyncedAt: reviewsSyncedAtResult };
 }
 
 // GitHub caps list endpoints at 100 items/page, so a single `per_page=100` fetch silently truncates a
@@ -2311,7 +2530,10 @@ export async function fetchRequiredStatusContexts(
     `/branches/${encodeURIComponent(baseRef)}/protection/required_status_checks`,
     token,
     githubRateLimitOptions(admissionKey),
-  ).catch(() => undefined);
+  ).catch((error) => {
+    recordBranchProtectionFetchFailure(error);
+    return undefined;
+  });
   if (!result) return null; // 404 / 403 (no admin:read) / error → conservative fold-all.
   const names = new Set<string>();
   for (const ctx of result.data.contexts ?? []) {
@@ -2321,6 +2543,95 @@ export async function fetchRequiredStatusContexts(
     if (typeof check?.context === "string" && check.context.trim().length > 0) names.add(check.context);
   }
   return names;
+}
+
+/**
+ * Merge a maintainer-configured `expectedCiContexts` allowlist (`settings.expectedCiContexts` /
+ * `.gittensory.yml` `gate.expectedCiContexts`) with the live branch-protection required-status-check
+ * contexts from {@link fetchRequiredStatusContexts}. Branch protection stays authoritative when
+ * readable; `expectedCiContexts` is UNIONED into it when both exist, and becomes the SOLE required-context
+ * source when branch protection is null/empty (unreadable, or simply not configured) — the generic config
+ * path the #2137 `ciCompletenessWarning` has always nudged a maintainer toward. A repo with neither
+ * configured returns null, preserving today's fold-all fail-closed `reduceLiveCiAggregate` behavior
+ * unchanged. Entries are trimmed and blanks dropped defensively (the focus-manifest parser already
+ * normalizes `expectedCiContexts`, but this is the single point every caller funnels through).
+ */
+export function mergeRequiredCiContexts(
+  branchProtectionContexts: ReadonlySet<string> | null,
+  expectedCiContexts: ReadonlyArray<string> | null | undefined,
+): Set<string> | null {
+  const expected = (expectedCiContexts ?? [])
+    .map((context) => context.trim())
+    .filter((context) => context.length > 0);
+  if (branchProtectionContexts && branchProtectionContexts.size > 0) {
+    return expected.length > 0 ? new Set([...branchProtectionContexts, ...expected]) : new Set(branchProtectionContexts);
+  }
+  return expected.length > 0 ? new Set(expected) : null;
+}
+
+// A GitHubApiError's own `.rateLimited` flag (set at construction from status/retry-after/remaining/body, see
+// GitHubApiError below) is ALREADY the correct rate-limit-vs-permission classification -- this just labels the
+// permission case with its own metric instead of the fetch's `.catch` silently discarding that information.
+// A non-GitHubApiError (a network/timeout failure) and a 404 (no branch protection configured) are equally
+// "fold all checks" outcomes for the caller, but neither is a permission denial, so neither is counted here.
+function recordBranchProtectionFetchFailure(error: unknown): void {
+  if (error instanceof GitHubApiError && error.statusCode === 403 && !error.rateLimited) {
+    incr(BRANCH_PROTECTION_PERMISSION_DENIED_METRIC);
+  }
+}
+
+/**
+ * Best-effort fetch of ONE named check-run's conclusion on a head SHA (#2564, the CLA-bot check-run detection
+ * mode of `gate.claMode`). The name match is bound to the configured trusted GitHub App slug so
+ * contributor-controlled same-name check-runs cannot spoof a legal/compliance gate. Returns the conclusion string (lowercased; `"neutral"`/`"success"`/… or `""` when
+ * concluded with no conclusion field, which should not normally happen) when a check-run with that exact name
+ * (case-insensitive) from that app slug is found; `null` when the head SHA has no such trusted check-run — a
+ * resolved "not found," distinct from "could not resolve" — which ALSO covers a missing `checkRunAppSlug`
+ * (no slug to trust means no run can ever match, a deterministic configuration gap, not a transient one);
+ * `undefined` when the check-runs themselves could not be read at all (network/auth error, or no headSha) —
+ * the caller must treat `undefined` as "not evaluated," never as "missing," so a transient fetch failure can
+ * never manufacture a false CLA-missing blocker. Scans only the FIRST page (100
+ * check-runs) — a CLA bot posts exactly one check-run, so a repo with >100 check-runs on a single commit (very
+ * unusual) risks missing it only in that pathological case, and still degrades to `undefined` (not evaluated)
+ * rather than a false negative.
+ */
+export async function fetchNamedCheckRunConclusion(
+  env: Env,
+  repoFullName: string,
+  headSha: string | null | undefined,
+  checkRunName: string,
+  checkRunAppSlug: string | null | undefined,
+  token: string | undefined,
+  admissionKey?: GitHubRateLimitAdmissionKey,
+): Promise<string | null | undefined> {
+  if (!headSha) return undefined;
+  const trustedAppSlugLc = checkRunAppSlug?.trim().toLowerCase();
+  // A missing trusted app slug is a deterministic CONFIGURATION gap, not a transient read failure -- without a
+  // slug to bind the match to, no check-run can ever be trusted, so this resolves the same as "no matching run
+  // found" (null), never `undefined` ("not evaluated"). Returning undefined here let a check-run-only blocking
+  // CLA config silently stop enforcing (a maintainer who set checkRunName but forgot checkRunAppSlug would have
+  // the gate fail OPEN forever, since the caller treats undefined as "retry later," not "missing") -- gate finding.
+  if (!trustedAppSlugLc) return null;
+  const result = await githubJsonWithHeaders<{ check_runs?: GitHubCheckRunPayload[] }>(
+    env,
+    repoFullName,
+    `/commits/${headSha}/check-runs?per_page=100&page=1`,
+    token,
+    githubRateLimitOptions(admissionKey),
+  ).catch(() => undefined);
+  if (!result) return undefined; // fetch failed → not evaluated, never a false "missing".
+  const nameLc = checkRunName.trim().toLowerCase();
+  const run = (result.data.check_runs ?? []).find(
+    (candidate) => candidate.name.trim().toLowerCase() === nameLc && candidate.app?.slug?.trim().toLowerCase() === trustedAppSlugLc,
+  );
+  if (!run) return null; // resolved: no trusted check-run with this name exists on this commit.
+  // A matching check-run that has NOT finished yet (status !== "completed") has conclusion: null by GitHub's
+  // own contract — that is "not yet resolved," not "resolved with an empty conclusion." Returning `undefined`
+  // here (rather than coercing to "") keeps this indistinguishable from a fetch failure to the caller, so
+  // `claMode: block` HOLDS instead of hard-failing a PR before the named check has actually finished running
+  // (#2564 gate-review finding).
+  if (run.status !== "completed") return undefined;
+  return (run.conclusion ?? "").toLowerCase();
 }
 
 // Minimal structural shape the CI reducer needs from a check-run — a superset of the REST GitHubCheckRunPayload
@@ -2699,7 +3010,7 @@ export async function fetchLiveBaseBranchAdvancedAt(
     repoFullName,
     `/commits/${encodeURIComponent(baseRef)}`,
     token,
-    githubRateLimitOptions(admissionKey),
+    { ...githubRateLimitOptions(admissionKey), bypassResponseCache: true },
   ).catch(() => undefined);
   return result?.data.commit?.committer?.date ?? undefined;
 }
@@ -2787,22 +3098,28 @@ function isPrStateCacheFresh(fetchedAt: string | null | undefined): boolean {
  *  the row's own `status` (defaulting to "never_synced" only when no row exists yet) — this write must NEVER force
  *  `status: "complete"`, since `status` is shared with the FILES-cache staleness machinery
  *  (backfillOpenPullRequestDetails / refreshPullRequestDetails treat `status !== "complete"` as "needs a files
- *  resync"); a PR-state-only write claiming `complete` would falsely mark a files sync that never happened. A
- *  write failure is swallowed (#2537 fail-open: the cache is an optimization, never a correctness dependency —
- *  every caller already tolerates a live-fetch fallback). */
+ *  resync"); a PR-state-only write claiming `complete` would falsely mark a files sync that never happened.
+ *  When that PR-state-only read advances `headSha`, clear `filesSyncedAt` in the same upsert so the shared
+ *  headSha/filesSyncedAt file-cache invariant never claims old files were fetched for the new head. A write
+ *  failure is swallowed (#2537 fail-open: the cache is an optimization, never a correctness dependency — every
+ *  caller already tolerates a live-fetch fallback). */
 async function writeThroughPrStateCache(
   env: Env,
   repoFullName: string,
   prNumber: number,
-  previousStatus: PullRequestDetailSyncStateRecord["status"] | undefined,
+  previousState: Pick<PullRequestDetailSyncStateRecord, "status" | "headSha" | "filesSyncedAt"> | null | undefined,
   fields: { prMergeableState?: string | null; prState?: string | null; headSha?: string | null },
 ): Promise<void> {
   incr(PR_STATE_CACHE_METRIC, { field: "write", result: "set" });
+  const fileSnapshotBecameStale = Boolean(
+    fields.headSha && previousState?.headSha && previousState.headSha !== fields.headSha && previousState.filesSyncedAt,
+  );
   await upsertPullRequestDetailSyncState(env, {
     repoFullName,
     pullNumber: prNumber,
-    status: previousStatus ?? "never_synced",
+    status: previousState?.status ?? "never_synced",
     prStateFetchedAt: nowIso(),
+    ...(fileSnapshotBecameStale ? { filesSyncedAt: null } : {}),
     ...fields,
   }).catch(() => undefined);
 }
@@ -2827,12 +3144,12 @@ async function fetchAndCachePrStateFields(
   prNumber: number,
   token: string | undefined,
   admissionKey: GitHubRateLimitAdmissionKey | undefined,
-  previousStatus: PullRequestDetailSyncStateRecord["status"] | undefined,
+  previousState: Pick<PullRequestDetailSyncStateRecord, "status" | "headSha" | "filesSyncedAt"> | null | undefined,
 ): Promise<GitHubPullRequestPayload | undefined> {
   const live = await fetchLivePullRequest(env, repoFullName, prNumber, token, admissionKey);
   if (!live) return undefined;
   const liveHeadSha = live.head?.sha;
-  await writeThroughPrStateCache(env, repoFullName, prNumber, previousStatus, {
+  await writeThroughPrStateCache(env, repoFullName, prNumber, previousState, {
     prMergeableState: live.mergeable_state ?? null,
     prState: live.state ?? null,
     // Omit (not null) when the live payload carries no head SHA -- mirrors primeDurablePrStateCache's own
@@ -2856,7 +3173,7 @@ export async function primeDurablePrStateCache(
   if (!live) return;
   const existing = await getPullRequestDetailSyncState(env, repoFullName, prNumber).catch(() => null);
   const liveHeadSha = live.head?.sha;
-  await writeThroughPrStateCache(env, repoFullName, prNumber, existing?.status, {
+  await writeThroughPrStateCache(env, repoFullName, prNumber, existing, {
     prMergeableState: live.mergeable_state ?? null,
     prState: live.state ?? null,
     // Omit (not null) when the live payload carries no head SHA — a PR-state-only write must never CLEAR the
@@ -2883,7 +3200,7 @@ export async function cachedFetchLivePullRequestMergeState(
     return cached.prMergeableState ?? undefined;
   }
   incr(PR_STATE_CACHE_METRIC, { field: "mergeable_state", result: "miss" });
-  const live = await fetchAndCachePrStateFields(env, repoFullName, prNumber, token, admissionKey, cached?.status);
+  const live = await fetchAndCachePrStateFields(env, repoFullName, prNumber, token, admissionKey, cached);
   return live?.mergeable_state ?? undefined;
 }
 
@@ -2902,7 +3219,7 @@ export async function cachedFetchLivePullRequestState(
     return cached.prState ?? undefined;
   }
   incr(PR_STATE_CACHE_METRIC, { field: "state", result: "miss" });
-  const live = await fetchAndCachePrStateFields(env, repoFullName, prNumber, token, admissionKey, cached?.status);
+  const live = await fetchAndCachePrStateFields(env, repoFullName, prNumber, token, admissionKey, cached);
   return live?.state ?? undefined;
 }
 
@@ -2925,7 +3242,7 @@ export async function cachedFetchLivePullRequestHeadSha(
     return cached.headSha;
   }
   incr(PR_STATE_CACHE_METRIC, { field: "head_sha", result: "miss" });
-  const live = await fetchAndCachePrStateFields(env, repoFullName, prNumber, token, admissionKey, cached?.status);
+  const live = await fetchAndCachePrStateFields(env, repoFullName, prNumber, token, admissionKey, cached);
   return live?.head?.sha ?? undefined;
 }
 
@@ -3539,6 +3856,7 @@ async function githubJson<T>(
 type GitHubJsonRequestOptions = {
   validators?: GitHubConditionalValidators;
   rateLimitAdmissionKey?: GitHubRateLimitAdmissionKey;
+  bypassResponseCache?: boolean;
 };
 type GitHubJsonStandardOptions = GitHubJsonRequestOptions & { allowNotModified?: false };
 type GitHubJsonConditionalOptions = GitHubJsonRequestOptions & { allowNotModified: true };
@@ -3575,8 +3893,12 @@ async function githubJsonWithHeaders<T>(
   let response = await timeoutFetch(url, {
     headers: githubRestHeaders(token, options?.validators),
     ...(options?.rateLimitAdmissionKey ? { githubRateLimitAdmission: true, githubRateLimitAdmissionKey: options.rateLimitAdmissionKey } : {}),
+    ...(options?.bypassResponseCache ? { githubBypassResponseCache: true } : {}),
   });
-  if (!isGitHubResponseCacheReplay(response)) {
+  // A bypass request is a live-freshness read (e.g. the fresh-rebase gate's base-tip check): it must neither
+  // replay nor be recorded into the persistent response/rate-limit-observation state, mirroring the
+  // isGitHubResponseCacheReplay guard immediately below for the same reason.
+  if (!isGitHubResponseCacheReplay(response) && !options?.bypassResponseCache) {
     await recordGitHubResponse(env, repoFullName, path, response, "rest", options?.rateLimitAdmissionKey);
   }
   if (response.status === 304 && options?.allowNotModified) return notModifiedResponse(response);

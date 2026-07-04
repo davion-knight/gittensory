@@ -16,12 +16,21 @@ const seedInstall = (e: Env, id: number, cols: Record<string, string | number | 
 };
 const brokerEnv = async (over: Partial<Env> = {}): Promise<Env> =>
   createTestEnv({ ORB_BROKER_ENABLED: "true", ORB_GITHUB_APP_ID: "4139483", ORB_GITHUB_APP_PRIVATE_KEY: await pkcs8Pem(), INTERNAL_JOB_TOKEN: "dev-internal-token", ...over });
-const tokenFetch = (token = "ghs_broker", expires = "2026-06-25T08:00:00Z") => vi.stubGlobal("fetch", async () => Response.json({ token, expires_at: expires }));
-const countingTokenFetch = (expires = "2026-06-25T08:00:00Z") => {
+// `exactOptionalPropertyTypes` forbids `KEY: undefined` overrides, so a truly-ABSENT App credential means simply
+// never setting the key (not spreading `undefined` over it) — hence a dedicated builder rather than `brokerEnv({...})`.
+const brokerEnvMissingAppCreds = async (missing: "id" | "key" | "both", over: Partial<Env> = {}): Promise<Env> => {
+  const base: Partial<Env> = { ORB_BROKER_ENABLED: "true", INTERNAL_JOB_TOKEN: "dev-internal-token", ...over };
+  if (missing !== "id") base.ORB_GITHUB_APP_ID = "4139483";
+  if (missing !== "key") base.ORB_GITHUB_APP_PRIVATE_KEY = await pkcs8Pem();
+  return createTestEnv(base);
+};
+const tokenFetch = (token = "ghs_broker", expires = "2026-06-25T08:00:00Z", permissions: Record<string, string> = {}) =>
+  vi.stubGlobal("fetch", async () => Response.json({ token, expires_at: expires, permissions }));
+const countingTokenFetch = (expires = "2026-06-25T08:00:00Z", permissions: Record<string, string> = {}) => {
   let calls = 0;
   vi.stubGlobal("fetch", async () => {
     calls += 1;
-    return Response.json({ token: `ghs_minted_${calls}`, expires_at: expires });
+    return Response.json({ token: `ghs_minted_${calls}`, expires_at: expires, permissions });
   });
   return () => calls;
 };
@@ -58,8 +67,8 @@ describe("brokerOrbToken", () => {
     const e = await brokerEnv();
     await seedInstall(e, 300, { registered: 1 });
     const { secret } = (await issueOrbEnrollment(e, 300)) as { secret: string };
-    tokenFetch("ghs_minted", "2026-06-25T08:00:00Z");
-    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted", installationId: 300, expiresAt: "2026-06-25T08:00:00Z" });
+    tokenFetch("ghs_minted", "2026-06-25T08:00:00Z", { contents: "write" });
+    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted", installationId: 300, expiresAt: "2026-06-25T08:00:00Z", permissions: { contents: "write" } });
     expect((await db(e).prepare("SELECT last_token_at FROM orb_enrollments WHERE installation_id=300").first<{ last_token_at: string | null }>())?.last_token_at).not.toBeNull();
   });
 
@@ -69,14 +78,36 @@ describe("brokerOrbToken", () => {
     const e = await brokerEnv({ TOKEN_ENCRYPTION_SECRET: "orb-cache-test-secret" });
     await seedInstall(e, 303, { registered: 1 });
     const { secret } = (await issueOrbEnrollment(e, 303)) as { secret: string };
-    const fetchCalls = countingTokenFetch("2026-06-25T08:00:00Z");
+    const fetchCalls = countingTokenFetch("2026-06-25T08:00:00Z", { contents: "write", pull_requests: "write" });
 
-    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted_1", installationId: 303, expiresAt: "2026-06-25T08:00:00Z" });
-    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted_1", installationId: 303, expiresAt: "2026-06-25T08:00:00Z" });
+    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted_1", installationId: 303, expiresAt: "2026-06-25T08:00:00Z", permissions: { contents: "write", pull_requests: "write" } });
+    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted_1", installationId: 303, expiresAt: "2026-06-25T08:00:00Z", permissions: { contents: "write", pull_requests: "write" } });
     expect(fetchCalls()).toBe(1);
     const row = await db(e).prepare("SELECT cached_token_json FROM orb_enrollments WHERE installation_id=303").first<{ cached_token_json: string }>();
     expect(row?.cached_token_json).toContain("ciphertext");
     expect(row?.cached_token_json).not.toContain("ghs_minted_1");
+  });
+
+  it("forceRefresh bypasses a still-fresh broker cache and replaces the returned permission snapshot", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-25T07:00:00Z"));
+    const e = await brokerEnv({ TOKEN_ENCRYPTION_SECRET: "orb-cache-test-secret" });
+    await seedInstall(e, 307, { registered: 1 });
+    const { secret } = (await issueOrbEnrollment(e, 307)) as { secret: string };
+    let calls = 0;
+    vi.stubGlobal("fetch", async () => {
+      calls += 1;
+      return Response.json({
+        token: `ghs_minted_${calls}`,
+        expires_at: "2026-06-25T08:00:00Z",
+        permissions: calls === 1 ? { contents: "read" } : { contents: "write" },
+      });
+    });
+
+    expect(await brokerOrbToken(e, secret)).toMatchObject({ token: "ghs_minted_1", permissions: { contents: "read" } });
+    expect(await brokerOrbToken(e, secret, { forceRefresh: true })).toMatchObject({ token: "ghs_minted_2", permissions: { contents: "write" } });
+    expect(await brokerOrbToken(e, secret)).toMatchObject({ token: "ghs_minted_2", permissions: { contents: "write" } });
+    expect(calls).toBe(2);
   });
 
   it("remints when the encrypted cache is absent, expired, or unreadable", async () => {
@@ -111,7 +142,7 @@ describe("brokerOrbToken", () => {
       return originalPrepare(sql);
     });
 
-    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_cache_write_failed", installationId: 305, expiresAt: "2026-06-25T08:00:00Z" });
+    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_cache_write_failed", installationId: 305, expiresAt: "2026-06-25T08:00:00Z", permissions: {} });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("orb_token_cache_write_failed"));
   });
 
@@ -133,7 +164,7 @@ describe("brokerOrbToken", () => {
       return originalPrepare(sql);
     });
 
-    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted_1", installationId: 306, expiresAt: "2026-06-25T08:00:00Z" });
+    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted_1", installationId: 306, expiresAt: "2026-06-25T08:00:00Z", permissions: {} });
     expect(fetchCalls()).toBe(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("orb_token_last_touch_failed"));
   });
@@ -153,6 +184,48 @@ describe("brokerOrbToken", () => {
     const { secret } = (await issueOrbEnrollment(e, 302)) as { secret: string };
     await db(e).prepare("UPDATE orb_github_installations SET suspended_at=CURRENT_TIMESTAMP WHERE installation_id=302").run();
     expect(await brokerOrbToken(e, secret)).toEqual({ error: "installation_not_eligible" });
+  });
+
+  it("#2710 regression: an invalid secret NEVER reveals broker misconfiguration — invalid_enrollment wins even with no App credentials at all", async () => {
+    // Before the fix, the ORB_GITHUB_APP_ID/PRIVATE_KEY check ran BEFORE the enrollment lookup, so ANY caller
+    // (no valid secret required) could learn the server's deployment-config state via the response code. The
+    // credential check must only ever run once the caller is already proven to hold a valid, eligible enrollment.
+    const e = await brokerEnvMissingAppCreds("both");
+    expect(await brokerOrbToken(e, "orbsec_totally_bogus")).toEqual({ error: "invalid_enrollment" });
+  });
+
+  it("returns broker_misconfigured only once the enrollment is valid+eligible and a real mint is required", async () => {
+    const missingAppId = await brokerEnvMissingAppCreds("id");
+    await seedInstall(missingAppId, 310, { registered: 1 });
+    const { secret: secretA } = (await issueOrbEnrollment(missingAppId, 310)) as { secret: string };
+    expect(await brokerOrbToken(missingAppId, secretA)).toEqual({ error: "broker_misconfigured" });
+
+    const missingPrivateKey = await brokerEnvMissingAppCreds("key");
+    await seedInstall(missingPrivateKey, 311, { registered: 1 });
+    const { secret: secretB } = (await issueOrbEnrollment(missingPrivateKey, 311)) as { secret: string };
+    expect(await brokerOrbToken(missingPrivateKey, secretB)).toEqual({ error: "broker_misconfigured" });
+  });
+
+  it("still eligible-checks BEFORE reporting broker_misconfigured (an ineligible install never leaks config state either)", async () => {
+    const e = await brokerEnvMissingAppCreds("both");
+    await seedInstall(e, 312, { registered: 1 });
+    const { secret } = (await issueOrbEnrollment(e, 312)) as { secret: string };
+    await db(e).prepare("UPDATE orb_github_installations SET removed_at=CURRENT_TIMESTAMP WHERE installation_id=312").run();
+    expect(await brokerOrbToken(e, secret)).toEqual({ error: "installation_not_eligible" });
+  });
+
+  it("serves a still-fresh cached token even with no Orb App credentials at all (mint is never reached)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-25T07:00:00Z"));
+    const e = await brokerEnv({ TOKEN_ENCRYPTION_SECRET: "orb-cache-test-secret" });
+    await seedInstall(e, 313, { registered: 1 });
+    const { secret } = (await issueOrbEnrollment(e, 313)) as { secret: string };
+    tokenFetch("ghs_minted", "2026-06-25T08:00:00Z");
+    expect(await brokerOrbToken(e, secret)).toEqual({ token: "ghs_minted", installationId: 313, expiresAt: "2026-06-25T08:00:00Z", permissions: {} });
+
+    // Drop the App credentials AFTER the initial mint+cache — a still-fresh cache hit must not need them.
+    const eNoCreds = await brokerEnvMissingAppCreds("both", { TOKEN_ENCRYPTION_SECRET: "orb-cache-test-secret", DB: e.DB });
+    expect(await brokerOrbToken(eNoCreds, secret)).toEqual({ token: "ghs_minted", installationId: 313, expiresAt: "2026-06-25T08:00:00Z", permissions: {} });
   });
 });
 

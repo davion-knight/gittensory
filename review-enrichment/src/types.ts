@@ -301,6 +301,38 @@ export interface BlameLinkFinding {
   lastTouchedByShaPrefix?: string;
 }
 
+/** An export newly ADDED to a package's public entrypoint (an `index.*` barrel) that ships with no adjacent doc
+ *  comment — undocumented public surface. Reports the symbol + its line only, never file contents. (#2035) */
+export interface UndocumentedExportFinding {
+  file: string;
+  line: number;
+  symbol: string;
+}
+
+/** A review/approval integrity signal, read from structured PR-reviews API fields only (state, commit_id,
+ *  user.login, submitted_at) — never diff/file content. `stale-approval`: the reviewer's latest APPROVED review
+ *  predates the PR's current head commit. `self-approval`: the PR author approved their own PR.
+ *  `outstanding-changes-requested`: the reviewer's CURRENT (most recent) review is still CHANGES_REQUESTED, not
+ *  yet superseded by a later review from the same person. */
+export type ApprovalIntegrityFinding =
+  | {
+      reviewer: string;
+      kind: "stale-approval";
+      /** Short prefix of the stale review's commit SHA (prefix only — never the full SHA). */
+      reviewedShaPrefix: string;
+    }
+  | { reviewer: string; kind: "self-approval" }
+  | { reviewer: string; kind: "outstanding-changes-requested" };
+
+/** A CI check-run signal, read from structured GitHub check-run API fields only (name, status, conclusion,
+ *  started_at, completed_at) — never logs or repo content. `retried-after-failure`: the named check's latest
+ *  completed run at the head commit is a success, but one or more earlier completed runs of the SAME name were
+ *  not (failure/timed_out/cancelled/action_required) — it did not go green on the first try.
+ *  `long-running-check`: a single completed run whose wall-clock duration crossed a fixed threshold. */
+export type CiCheckSignalFinding =
+  | { checkName: string; kind: "retried-after-failure"; failedAttempts: number }
+  | { checkName: string; kind: "long-running-check"; durationMinutes: number };
+
 /** Structured analyzer output. Each analyzer fills its own key; more land as analyzers ship (#1477/#1478). */
 export interface BriefFindings {
   dependency?: DependencyFinding[];
@@ -325,6 +357,9 @@ export interface BriefFindings {
   duplication?: DuplicationFinding[];
   churnHotspot?: ChurnHotspotFinding[];
   blameLink?: BlameLinkFinding[];
+  approvalIntegrity?: ApprovalIntegrityFinding[];
+  ciCheckSignals?: CiCheckSignalFinding[];
+  undocumentedExport?: UndocumentedExportFinding[];
 }
 
 /** A JSDoc/TSDoc block whose `@param` tags name parameters the adjacent function no longer declares — a

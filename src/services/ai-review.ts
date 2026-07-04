@@ -30,6 +30,7 @@ import { errorMessage } from "../utils/json";
 import type { ReviewProfile } from "../signals/focus-manifest";
 import { isCodeFile } from "../signals/local-branch";
 import { isTestPath } from "../signals/test-evidence";
+import type { CombineStrategy, OnMerge } from "../types";
 
 /**
  * The best free Workers-AI model pair for review accuracy — two different families for independence,
@@ -79,17 +80,87 @@ export type AiReviewProviderKey = {
   model?: string | null | undefined;
 };
 
+// `CombineStrategy` / `OnMerge` (#dual-ai-combiner) are defined in ../types.ts, not here, and re-exported for
+// backward compat: both this file's own callers AND signals/focus-manifest.ts + types.ts's RepositorySettings
+// need the type, but focus-manifest.ts/types.ts are imported by the UI workspace, which lacks the ambient
+// Cloudflare Workers types (`Env`, `D1Database`, …) this file's runtime code depends on — a type-only
+// `import("../services/ai-review")` reference from either would still drag this whole module graph into the UI's
+// typecheck and break it (#2567 follow-up fix). See ../types.ts for the full doc comment.
+export type { CombineStrategy, OnMerge } from "../types";
+
 /**
- * How the independent reviewer opinions are combined into ONE gate decision (#dual-ai-combiner):
- *   • `single`     — one reviewer; its verdict IS the decision (a named blocker blocks).
- *   • `consensus`  — two reviewers; block ONLY when BOTH name a blocker; lone blocker → split (hold). The
- *                    historical cloud behavior — the default, so an unset `combine` is byte-identical.
- *   • `synthesis`  — two reviewers run separately, then merge into ONE decision (no split/hold-on-disagree):
- *                    `onMerge: either` blocks if EITHER flags a blocker; `both` only if all do.
+ * Resolve the EFFECTIVE `onMerge` rule for a review call, enforcing that a per-repo `.gittensory.yml
+ * gate.aiReview.onMerge` override (#2567) can only TIGHTEN the self-host operator's `AI_REVIEW_PLAN.onMerge`
+ * floor, never loosen it. `either` is the STRICTER rule (any one reviewer's blocker blocks/holds); `both` is
+ * more PERMISSIVE (requires every reviewer to agree before a blocker counts). So:
+ *   - operator floor `either` + repo override `both`  → CLAMPED to `either` (an attempted loosening).
+ *   - operator floor `either` + repo override `either` → `either` (a no-op tightening).
+ *   - operator floor `both` (or unset)                → the repo override (or the operator's own value) wins
+ *     unclamped — there is no stricter floor to violate.
+ * Returns the resolved value alongside whether a clamp fired, so the caller can log/surface it (a maintainer
+ * who configured a loosening override should see it was not honored, not have it silently ignored).
  */
-export type CombineStrategy = "single" | "consensus" | "synthesis";
-/** Synthesis merge rule — block if `either` reviewer flags a blocker, or only when `both` agree. */
-export type OnMerge = "either" | "both";
+export function resolveEffectiveAiReviewOnMerge(
+  repoOverride: OnMerge | null | undefined,
+  operatorFloor: OnMerge | null | undefined,
+): { onMerge: OnMerge | null | undefined; clamped: boolean } {
+  if (repoOverride == null) return { onMerge: operatorFloor, clamped: false };
+  if (operatorFloor === "either" && repoOverride === "both") {
+    return { onMerge: "either", clamped: true };
+  }
+  return { onMerge: repoOverride, clamped: false };
+}
+
+type AiReviewPlanShape = {
+  combine?: CombineStrategy | null | undefined;
+  onMerge?: OnMerge | null | undefined;
+  reviewers?: ReadonlyArray<{ model: string; fallback?: string | null | undefined }> | null | undefined;
+};
+
+/**
+ * Resolve the FULL effective dual-AI plan (combine + onMerge + reviewers together), extending
+ * resolveEffectiveAiReviewOnMerge to close a gap it left open (gate finding on #2567): clamping `onMerge`
+ * alone does not protect the operator's `either` floor if a repo can ALSO shrink the reviewer count or switch
+ * to `combine: "single"` -- either change reduces the number of independent opinions that can trigger a
+ * blocker, achieving the same effective loosening `onMerge` alone was meant to prevent (an operator plan of
+ * two reviewers under `either` means "either ONE of two can flag it"; drop to one reviewer and there is only
+ * ever one vote to begin with, silently narrowing the floor without ever touching `onMerge`).
+ *
+ * When the operator has NOT set an `either` floor, every field resolves unclamped (repo override, else
+ * operator's own value) -- there is nothing to protect. When the operator HAS set `either`, a repo override
+ * that would reduce the effective reviewer count below the operator's own count (via a shorter `reviewers`
+ * list or a `combine: "single"` switch) is clamped: the repo's `combine`/`reviewers` overrides are ignored
+ * entirely and the operator's own values are used instead, while `onMerge` still resolves normally through
+ * resolveEffectiveAiReviewOnMerge. `clamped` is true if EITHER the onMerge clamp or this reviewer-count clamp
+ * fired, so the caller can surface either kind identically.
+ */
+export function resolveEffectiveAiReviewPlan(
+  repoOverride: AiReviewPlanShape,
+  operatorPlan: AiReviewPlanShape | null | undefined,
+): { combine: CombineStrategy | null | undefined; onMerge: OnMerge | null | undefined; reviewers: AiReviewPlanShape["reviewers"]; clamped: boolean } {
+  const onMergeResolution = resolveEffectiveAiReviewOnMerge(repoOverride.onMerge, operatorPlan?.onMerge);
+  const hasOperatorFloor = operatorPlan?.onMerge === "either";
+  if (hasOperatorFloor) {
+    // The operator's OWN effective reviewer count under their plan -- absent reviewers falls back to the
+    // built-in default pair (2), the historical dual-reviewer behavior (see GittensoryAiReviewInput.reviewers).
+    const operatorReviewerCount = operatorPlan?.reviewers?.length ?? 2;
+    const repoReviewerCount = repoOverride.reviewers?.length ?? operatorReviewerCount;
+    const reducesReviewerCount = repoOverride.reviewers != null && repoReviewerCount < operatorReviewerCount;
+    // Must be the REPO'S OWN combine value, not `repoOverride.combine ?? operatorPlan?.combine` -- that
+    // fallback made an operator plan that itself sets `combine: "single"` (no repo override at all) spuriously
+    // report `clamped: true` on every call, since there is nothing for the repo to have bypassed.
+    const collapsesToSingleReviewer = repoOverride.combine === "single" && operatorReviewerCount > 1;
+    if (reducesReviewerCount || collapsesToSingleReviewer) {
+      return { combine: operatorPlan?.combine, onMerge: onMergeResolution.onMerge, reviewers: operatorPlan?.reviewers, clamped: true };
+    }
+  }
+  return {
+    combine: repoOverride.combine ?? operatorPlan?.combine,
+    onMerge: onMergeResolution.onMerge,
+    reviewers: repoOverride.reviewers ?? operatorPlan?.reviewers,
+    clamped: onMergeResolution.clamped,
+  };
+}
 
 export type GittensoryAiReviewInput = {
   repoFullName: string;
@@ -161,6 +232,14 @@ export type GittensoryAiReviewInput = {
    * consensus-defect pass still runs the same), just how much advisory detail the prose carries.
    */
   profile?: ReviewProfile | null | undefined;
+  /**
+   * `.gittensory.yml` `review.security_focus` (#review-security-focus): when true, instructs the reviewer to
+   * prioritize a security-defect category — injection, authn/authz bypass, secret handling, unsafe
+   * deserialization, SSRF, and path traversal — with elevated scrutiny. ORTHOGONAL to `profile`: it composes
+   * with (never replaces) the chill/balanced/assertive volume tuning above — a "what to prioritize" axis, not a
+   * fourth profile level. Absent/false (the default) ⇒ the reviewer prompt is byte-identical to today.
+   */
+  securityFocus?: boolean | undefined;
   /**
    * `.gittensory.yml` `review.path_instructions` (#review-path-instructions), pre-resolved by the caller to the
    * entries whose glob matched THIS PR's changed files (via `resolveReviewPathInstructions`) — a ready-to-append
@@ -533,6 +612,13 @@ const REVIEW_PROFILE_SUFFIX: Record<"chill" | "assertive", string> = {
     "\n\nReview profile: ASSERTIVE. Beyond blocking defects, also surface minor improvements, style/consistency suggestions, and nitpicks — be thorough and exacting, clearly marking each non-blocking item as a nit.",
 };
 
+// `.gittensory.yml` review.security_focus → an appended security-prioritization instruction (#review-security-focus).
+// ORTHOGONAL to REVIEW_PROFILE_SUFFIX above — it composes with (never replaces) the chill/balanced/assertive volume
+// tuning: profile controls HOW MANY findings surface, this controls WHAT KIND the reviewer hunts for with elevated
+// scrutiny. False/absent (default) appends nothing (byte-identical).
+const SECURITY_FOCUS_SUFFIX =
+  "\n\nSECURITY FOCUS: Beyond the usual review, prioritize hunting for security defects with elevated scrutiny — injection (SQL/command/template/log), authentication/authorization bypass, unsafe secret handling (hardcoded credentials, logged/leaked tokens), unsafe deserialization, server-side request forgery (SSRF), and path traversal. Treat a credible finding in any of these categories as a blocker even if it would otherwise read as a nit.";
+
 // `.gittensory.yml` review.inline_comments → an appended instruction to ALSO emit line-anchored findings for
 // quiet inline PR comments (#inline-comments). Absent/off appends nothing (byte-identical). The model keeps the
 // existing 4-field shape and simply ADDS an `inlineFindings` array.
@@ -540,8 +626,9 @@ const INLINE_FINDINGS_SUFFIX =
   '\n\nINLINE FINDINGS: ALSO include an additional top-level field "inlineFindings" in the SAME JSON object — an array (possibly empty) of your most important findings, each anchored to a specific changed line, for inline PR comments. Each item: {"path": the changed file path EXACTLY as shown in the diff, "line": the 1-based line number in the NEW file (count forward from the "+" start in the nearest "@@ -old +new @@" hunk header) of an ADDED ("+") line you are commenting on, "severity": "blocker" or "nit", "body": the one-sentence finding, "suggestion": optional replacement text for that line}. Include ONLY findings you can place on a specific added line; OMIT any you cannot anchor precisely (a wrong line is worse than none). If a suggestion is blank or you are not confident in an exact replacement, omit the suggestion field and keep the finding. At most ~10 items.';
 
 /** The effective reviewer SYSTEM prompt. Appends the grounding-discipline suffix when the caller supplied one
- *  (flag GITTENSORY_REVIEW_GROUNDING on), the `review.profile` tone suffix when set, then the inline-findings
- *  instruction when the caller asked for them; all absent (default) → the base prompt, byte-identical to today. */
+ *  (flag GITTENSORY_REVIEW_GROUNDING on), the `review.profile` tone suffix when set, the `review.security_focus`
+ *  prioritization suffix when on, then the inline-findings instruction when the caller asked for them; all absent
+ *  (default) → the base prompt, byte-identical to today. */
 function buildSystemPrompt(input: GittensoryAiReviewInput): string {
   const groundingSuffix = input.grounding?.systemSuffix ?? "";
   // Review-enrichment brief (#1472): the REES supplies a one-line discipline suffix ("treat a listed CVE/secret as
@@ -551,6 +638,7 @@ function buildSystemPrompt(input: GittensoryAiReviewInput): string {
     input.profile === "chill" || input.profile === "assertive"
       ? REVIEW_PROFILE_SUFFIX[input.profile]
       : "";
+  const securityFocusSuffix = input.securityFocus === true ? SECURITY_FOCUS_SUFFIX : "";
   // `.gittensory.yml` review.path_instructions (#review-path-instructions): the caller pre-resolved the entries
   // matching this PR's files into a prompt section; empty ⇒ nothing appended (byte-identical).
   const pathSuffix = input.pathGuidance?.trim() ? input.pathGuidance : "";
@@ -560,7 +648,7 @@ function buildSystemPrompt(input: GittensoryAiReviewInput): string {
     ? ` REPOSITORY REVIEW INSTRUCTIONS (maintainer conventions for this repo — honor them unless they conflict with a real defect): ${input.repoInstructions.trim()}`
     : "";
   const inlineSuffix = input.inlineFindings ? INLINE_FINDINGS_SUFFIX : "";
-  return `${REVIEW_SYSTEM_PROMPT}${groundingSuffix}${enrichmentSuffix}${profileSuffix}${pathSuffix}${repoInstructionsSuffix}${inlineSuffix}`;
+  return `${REVIEW_SYSTEM_PROMPT}${groundingSuffix}${enrichmentSuffix}${profileSuffix}${securityFocusSuffix}${pathSuffix}${repoInstructionsSuffix}${inlineSuffix}`;
 }
 
 /** One Workers-AI opinion with a per-slot reliable fallback and a 3× retry on the primary. */
@@ -1078,12 +1166,22 @@ export async function runGittensoryAiReview(
   // combined by `consensus` — byte-identical to today. The self-host boot plan (`env.AI_REVIEW_PLAN`) supplies
   // named providers (e.g. claude-code + codex) and a strategy; an explicit `input` field overrides it. `single`
   // (or a single configured reviewer) runs ONE opinion; consensus/synthesis run two.
+  //
+  // combine/onMerge/reviewers are a per-repo REFINEMENT of the operator's plan, never a bypass (#2567): a repo
+  // can only TIGHTEN the operator's `either` floor, never loosen it by shrinking the reviewer count or
+  // switching to `combine: "single"` either (a floor of "either ONE of two reviewers can flag it" is just as
+  // bypassed by dropping to one reviewer as by flipping onMerge itself). resolveEffectiveAiReviewPlan enforces
+  // the clamp across all three fields together; a fired clamp increments a metric so it is surfaced, not
+  // silently ignored (mirrors the gittensory_ai_review_inconclusive_total pattern below).
   const plan = env.AI_REVIEW_PLAN;
+  const planResolution = resolveEffectiveAiReviewPlan(
+    { combine: input.combine, onMerge: input.onMerge, reviewers: input.reviewers },
+    plan,
+  );
   const configured: ReadonlyArray<{
     model: string;
     fallback?: string | null | undefined;
-  }> | null =
-    (input.reviewers?.length ? input.reviewers : plan?.reviewers) ?? null;
+  }> | null = planResolution.reviewers?.length ? planResolution.reviewers : null;
   const primary = configured?.[0] ?? {
     model: BEST_REVIEW_MODELS[0],
     fallback: RELIABLE_FALLBACK_MODELS[0] as string | null,
@@ -1096,9 +1194,11 @@ export async function runGittensoryAiReview(
   // i.e. runWorkersOpinion's single-model path).
   const primaryFallback = primary.fallback ?? primary.model;
   const secondaryFallback = secondary.fallback ?? secondary.model;
-  const combine: CombineStrategy =
-    input.combine ?? plan?.combine ?? "consensus";
-  const onMerge: OnMerge | null | undefined = input.onMerge ?? plan?.onMerge;
+  const combine: CombineStrategy = planResolution.combine ?? "consensus";
+  const onMerge = planResolution.onMerge;
+  if (planResolution.clamped) {
+    incr("gittensory_ai_review_onmerge_clamped_total", { mode: input.mode });
+  }
   const dual = combine !== "single" && (!configured || configured.length > 1);
   const freeAiCalls =
     (input.mode === "block" ? (dual ? 2 : 1) : 0) + (input.providerKey ? 0 : 1);

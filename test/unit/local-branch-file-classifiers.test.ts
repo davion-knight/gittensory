@@ -55,6 +55,11 @@ describe("isTestFile", () => {
       "calc.test.py",
       "user.spec.rb",
       "engine.test.rs",
+      // .mts/.cts/.mjs/.cjs test files must count as tests (else a .test.mts is misclassified as source).
+      "loader.test.mts",
+      "config.spec.cts",
+      "widget.test.mjs",
+      "legacy.spec.cjs",
       "Engine.Test.TS",
     ]) {
       expect(isTestFile(path)).toBe(true);
@@ -106,7 +111,21 @@ describe("isCodeFile", () => {
       "server/Main.java",
       "cmd/server/main.go",
       "migrations/0001_init.sql",
+      // Node/TypeScript ESM + CommonJS module files are code (rag.ts's JS_TS_RE already recognizes .mjs/.cjs).
+      "src/loader.mjs",
+      "src/legacy.cjs",
+      "src/config.mts",
+      "src/setup.cts",
       "helper_test.ts",
+      // C#/Swift/Groovy source — their test files are already recognized by
+      // isTestPath, so their source must count as code too.
+      "Api/Controllers/UserController.cs",
+      "Sources/App/Router.swift",
+      "src/main/groovy/Pipeline.groovy",
+      // PHP source — isTestPath already recognizes PHPUnit/PHPSpec `SomethingTest`/`Spec`
+      // files, so PHP source must count as code too (else it is neither test nor code).
+      "app/Http/Controllers/UserController.php",
+      "src/Service/PaymentGateway.php",
     ]) {
       expect(isCodeFile(path)).toBe(true);
     }
@@ -120,6 +139,14 @@ describe("isCodeFile", () => {
       "service_test.py",
       "models/account_test.rb",
       "__tests__/component.jsx",
+      // module-extension e2e tests must not count as code
+      "e2e/checkout.cy.mts",
+      "e2e/flow.e2e.mjs",
+      // C#/Swift test files carry a code extension but are tests, not code.
+      "Services/AccountTests.cs",
+      "AppTests/LoginTests.swift",
+      // PHP class-suffix test file (PHPUnit) — code extension, but a test, not code.
+      "app/Service/PaymentTest.php",
     ]) {
       expect(isCodeFile(path)).toBe(false);
     }

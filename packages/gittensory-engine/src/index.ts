@@ -10,7 +10,15 @@ export {
   type OpportunityRankInput,
 } from "./opportunity-ranker.js";
 export * from "./governor/rate-limit.js";
+export {
+  GOVERNOR_LEDGER_EVENT_TYPES,
+  normalizeGovernorLedgerEvent,
+  type GovernorLedgerEvent,
+  type GovernorLedgerEventType,
+  type NormalizedGovernorLedgerEvent,
+} from "./governor-ledger.js";
 export * from "./plan-export.js";
+export * from "./plan-templates.js";
 export * from "./portfolio/queue.js";
 export {
   resolveAiPolicyVerdict,
@@ -20,6 +28,39 @@ export {
 } from "./ai-policy-map.js";
 export {
   DEFAULT_MINER_GOAL_SPEC,
+  parseMinerGoalSpec,
+  parseMinerGoalSpecContent,
+  discoverMinerGoalSpecPath,
+  MINER_GOAL_SPEC_FILENAMES,
   type MinerGoalSpec,
   type MinerIssueDiscoveryPolicy,
+  type ParsedMinerGoalSpec,
 } from "./miner-goal-spec.js";
+export {
+  computeMinerGoalLaneFit,
+  isMinerRepoTargetable,
+} from "./miner-goal-lane-fit.js";
+export {
+  computeOpportunityFreshness,
+  type FreshnessIssue,
+} from "./opportunity-freshness.js";
+export { computeOpportunityCompetition } from "./opportunity-competition.js";
+export {
+  computeLaneFit,
+  type GoalModelInput,
+} from "./goal-model.js";
+export {
+  classifyContributorFit,
+  type ContributorFit,
+  type ContributorFitCheck,
+  type ContributorFitProfile,
+} from "./contributor-fit.js";
+export {
+  buildMetadataRankInput,
+  computeMetadataDupRisk,
+  computeMetadataFeasibility,
+  computeMetadataPotential,
+  rankMetadataOpportunities,
+  type MetadataCandidateIssue,
+  type MetadataRankContext,
+} from "./opportunity-metadata.js";

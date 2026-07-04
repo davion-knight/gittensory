@@ -6,7 +6,13 @@ import { createPgQueue } from "../../src/selfhost/pg-queue";
 import { queueSnapshotFromBinding } from "../../src/selfhost/queue-common";
 import { renderMetrics, resetMetrics } from "../../src/selfhost/metrics";
 import { RetryableJobError } from "../../src/queue/retryable";
+import { hostLoadAvg1PerCore } from "../../src/selfhost/host-pressure";
 import type { JobMessage } from "../../src/types";
+
+// Real host CPU load is nondeterministic (and can legitimately spike on a busy CI runner), so every
+// maintenance-admission test in this file would be flaky against the real node:os signal. Default to
+// "unavailable" (null, never gates) here; individual host-load tests override the mock explicitly.
+vi.mock("../../src/selfhost/host-pressure", () => ({ hostLoadAvg1PerCore: vi.fn(() => null) }));
 
 const msg = (t: string): JobMessage => ({ type: t }) as unknown as JobMessage;
 const webhook = (sender: { login: string; type: string }, eventName = "issue_comment", action = "edited"): JobMessage =>
@@ -63,6 +69,29 @@ interface MockPool {
    *  on a specific row (rowCount 0) while another succeeds (rowCount 1). */
   setReviveUpdateRowCounts(rowCounts: number[]): void;
   setRateLimitRows(rows: Array<{ admission_key?: string | null; repo_full_name?: string | null; remaining: number | string | null; reset_at: string | null; observed_at?: string | null }>): void;
+  /** Configures the three maintenance-admission pressure aggregate queries (live + maintenance + backlog-
+   *  convergence lane). Defaults to zero pending / null oldest in all lanes (pressure clear) until set.
+   *  `runnableCnt`/`oldestRunnable` back the #selfhost-queue-liveness runnable-now split (see
+   *  maintenancePressureSignals's FILTER columns); they default to 0/null (nothing runnable) so existing tests
+   *  that never set them keep working. */
+  setPressureSignals(signals: {
+    live?: { cnt: number; oldest: number | null; runnableCnt?: number; oldestRunnable?: number | null };
+    maintenance?: { cnt: number; oldest: number | null };
+    backlogConvergence?: { cnt: number };
+  }): void;
+  /** Programs the exact rows returned by releaseStaleForegroundDeferrals' candidate SELECT
+   *  (`WHERE status='pending' AND priority>=$1 AND run_after>$2`), and the per-row rowCount its conditional
+   *  UPDATE reports (defaults to 1 -- the row still matched at UPDATE time -- when not otherwise queued).
+   *  `payload` defaults to a "recapture-preview" message -- a foreground type NOT in
+   *  GITHUB_BUDGET_BACKGROUND_TYPES / not "github-webhook"/"agent-regate-pr" -- so
+   *  githubRateLimitAdmissionTargetForJob returns null for it and the rate-limit-clear OR-condition is
+   *  trivially/always true, isolating the AGE condition cleanly for tests that aren't specifically about
+   *  rate-limit clearing. Pass an explicit `payload` (e.g. a github-webhook message) plus `setRateLimitRows`
+   *  to test the rate-limit-clear condition itself, or "not valid json" to test the unparseable-payload path. */
+  setForegroundLivenessCandidates(
+    rows: Array<{ id: string; created_at: number; payload?: string }>,
+    updateRowCounts?: number[],
+  ): void;
 }
 
 function makePool(): MockPool {
@@ -70,8 +99,59 @@ function makePool(): MockPool {
   let deferUpdateRowCount = 1;
   const reviveUpdateRowCounts: number[] = [];
   let rateLimitRows: Array<{ admission_key?: string | null; repo_full_name?: string | null; remaining: number | string | null; reset_at: string | null; observed_at?: string | null }> = [];
+  let pressureLive: { cnt: number; oldest: number | null; runnableCnt?: number; oldestRunnable?: number | null } = {
+    cnt: 0,
+    oldest: null,
+  };
+  let pressureMaintenance: { cnt: number; oldest: number | null } = { cnt: 0, oldest: null };
+  let pressureBacklogConvergence: { cnt: number } = { cnt: 0 };
+  let foregroundLivenessCandidates: Array<{ id: string; created_at: number; payload?: string }> = [];
+  const foregroundLivenessUpdateRowCounts: number[] = [];
+  const DEFAULT_FOREGROUND_LIVENESS_PAYLOAD = JSON.stringify({
+    type: "recapture-preview",
+    deliveryId: "seed",
+    repoFullName: "o/r",
+    prNumber: 1,
+    attempt: 1,
+  });
   const fn = vi.fn().mockImplementation(async (sql: unknown, params?: unknown[]) => {
     const q = String(sql);
+    if (q.includes("SELECT id, payload, created_at FROM") && q.includes("priority>=$1 AND run_after>$2")) {
+      return {
+        rows: foregroundLivenessCandidates.map((row) => ({
+          id: row.id,
+          payload: row.payload ?? DEFAULT_FOREGROUND_LIVENESS_PAYLOAD,
+          created_at: row.created_at,
+        })),
+        rowCount: foregroundLivenessCandidates.length,
+      };
+    }
+    if (q.includes("SET run_after=$1 WHERE id=$2 AND status='pending' AND run_after>$1")) {
+      const rowCount =
+        foregroundLivenessUpdateRowCounts.length > 0 ? (foregroundLivenessUpdateRowCounts.shift() ?? 1) : 1;
+      return { rows: [], rowCount };
+    }
+    if (q.includes("AS cnt, MIN(created_at) AS oldest")) {
+      const signal = q.includes("is_maintenance=1") ? pressureMaintenance : pressureLive;
+      return {
+        rows: [
+          {
+            cnt: String(signal.cnt),
+            oldest: signal.oldest,
+            ...(signal === pressureLive
+              ? {
+                  runnable_cnt: String(pressureLive.runnableCnt ?? 0),
+                  oldest_runnable: pressureLive.oldestRunnable ?? null,
+                }
+              : {}),
+          },
+        ],
+        rowCount: 1,
+      };
+    }
+    if (q.includes("AS cnt") && q.includes("foreground_lane='backlog'")) {
+      return { rows: [{ cnt: String(pressureBacklogConvergence.cnt) }], rowCount: 1 };
+    }
     if (q.includes("FROM github_rate_limit_observations")) {
       const admissionKey = typeof params?.[0] === "string" ? params[0] : null;
       const newest = (rows: typeof rateLimitRows) =>
@@ -92,6 +172,17 @@ function makePool(): MockPool {
     if (q.includes("SET status='pending', run_after=$1, last_error=NULL")) {
       const rowCount = reviveUpdateRowCounts.length > 0 ? (reviveUpdateRowCounts.shift() ?? 1) : 1;
       return { rows: [], rowCount };
+    }
+    // The claim-time fairness sequence allocator (#selfhost-backlog-convergence) ALSO uses RETURNING (atomic
+    // UPDATE ... RETURNING, not a separate SELECT-then-UPDATE — see claimNextForegroundLane). It must be
+    // matched BEFORE the generic job-claim RETURNING check below, or it would wrongly pop a job row queued via
+    // enqueueJob/enqueueResult meant for the real claim query. A harmless fixed default (sequence 0 -> lane
+    // "backlog", no repo) lets every pre-existing test that doesn't care about fairness behave exactly as
+    // before: the backlog-scoped claim then finds nothing (no candidates SELECT is mocked here), so
+    // claimNextForegroundLane returns null and claimNext() falls through to the plain unscoped claim query,
+    // which IS the generic RETURNING branch below.
+    if (q.includes("_selfhost_queue_fairness") && q.includes("RETURNING")) {
+      return { rows: [{ claim_sequence: 0, last_backlog_repo: null }], rowCount: 1 };
     }
     // Claim queries use RETURNING — pop from queue; fall through to empty default otherwise.
     if (q.includes("RETURNING")) {
@@ -118,8 +209,18 @@ function makePool(): MockPool {
       reviveUpdateRowCounts.length = 0;
       reviveUpdateRowCounts.push(...rowCounts);
     },
+    setPressureSignals(signals) {
+      if (signals.live) pressureLive = signals.live;
+      if (signals.maintenance) pressureMaintenance = signals.maintenance;
+      if (signals.backlogConvergence) pressureBacklogConvergence = signals.backlogConvergence;
+    },
     setRateLimitRows(rows) {
       rateLimitRows = rows;
+    },
+    setForegroundLivenessCandidates(rows, updateRowCounts) {
+      foregroundLivenessCandidates = rows;
+      foregroundLivenessUpdateRowCounts.length = 0;
+      if (updateRowCounts) foregroundLivenessUpdateRowCounts.push(...updateRowCounts);
     },
   };
 }
@@ -131,6 +232,7 @@ describe("createPgQueue (durable #977)", () => {
     vi.useRealTimers();
     resetMetrics();
     vi.restoreAllMocks();
+    vi.mocked(hostLoadAvg1PerCore).mockReturnValue(null);
   });
 
   it("init() creates the table and recovers stuck-processing jobs", async () => {
@@ -159,6 +261,7 @@ describe("createPgQueue (durable #977)", () => {
   it("init() backfills event-aware priorities with the shared classifier", async () => {
     const m = makePool();
     m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // DDL
+    m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // fairness singleton INSERT
     m.fn.mockResolvedValueOnce({
       rows: [
         { id: "a", payload: JSON.stringify(msg("agent-regate-pr")), priority: 0 },
@@ -340,12 +443,29 @@ describe("createPgQueue (durable #977)", () => {
     );
     expect(m.pool.query).toHaveBeenCalledWith(
       expect.stringContaining("SET payload=$1, run_after=GREATEST"),
-      expect.arrayContaining([expect.stringContaining('"deliveryId":"ci-2"'), expect.any(Number), expect.any(Number), 10, "existing"]),
+      expect.arrayContaining([expect.stringContaining('"deliveryId":"ci-2"'), expect.any(Number), 10, "existing"]),
     );
     expect(m.pool.query).not.toHaveBeenCalledWith(
       expect.stringContaining("INSERT INTO _selfhost_jobs (payload"),
       expect.arrayContaining([expect.stringContaining('"deliveryId":"ci-2"')]),
     );
+  });
+
+  it("does not reset created_at when coalescing a re-enqueue into an existing pending row (regression for #selfhost-runtime-drift)", async () => {
+    // created_at anchors the maintenance trickle's age clock (maintenance-admission.ts). If a coalesced
+    // re-enqueue reset it, a periodic scheduler re-requesting the same still-pending maintenance job faster
+    // than the trickle's maxDeferAgeMs would re-arm the clock forever and defeat the anti-starvation escape.
+    const m = makePool();
+    const q = createPgQueue(m.pool, async () => undefined);
+    await q.init();
+    m.fn.mockResolvedValueOnce({ rows: [{ id: "existing" }], rowCount: 1 });
+
+    await q.binding.send(msg("refresh-registry"));
+
+    const calls = (m.fn as unknown as ReturnType<typeof vi.fn>).mock.calls;
+    const coalesceCall = calls.find((c: unknown[]) => String(c[0]).includes("SET payload=$1, run_after=GREATEST"));
+    expect(coalesceCall?.[0]).toBeDefined();
+    expect(String(coalesceCall?.[0])).not.toContain("created_at");
   });
 
   it("lets a pending full RAG index absorb a later repo incremental", async () => {
@@ -392,7 +512,6 @@ describe("createPgQueue (durable #977)", () => {
       expect.arrayContaining([
         expect.stringContaining('"requestedBy":"schedule"'),
         expect.any(Number),
-        expect.any(Number),
         0,
         "rag-index-repo:jsonbored/gittensory:full",
         "existing-incremental",
@@ -401,6 +520,150 @@ describe("createPgQueue (durable #977)", () => {
     expect(m.pool.query).toHaveBeenCalledWith(
       expect.stringContaining("DELETE FROM _selfhost_jobs"),
       ["existing-incremental", "rag-index-repo:jsonbored/gittensory:".length, "rag-index-repo:jsonbored/gittensory:"],
+    );
+  });
+
+  // #selfhost-maintenance-self-pin: mirrors selfhost-sqlite-queue.test.ts -- two pending incrementals for the
+  // same repo merge into one row's union path set instead of piling up as separate maintenance-lane rows.
+  it("merges a new incremental RAG job into an already-pending incremental for the same repo", async () => {
+    const m = makePool();
+    const q = createPgQueue(m.pool, async () => undefined);
+    await q.init();
+    m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // absorbedByKey check: no pending FULL job for this repo
+    m.fn.mockResolvedValueOnce({
+      rows: [{ id: "existing-incremental", payload: JSON.stringify({ type: "rag-index-repo", requestedBy: "webhook", repoFullName: "JSONbored/gittensory", paths: ["src/a.ts"] }), job_key: "rag-index-repo:jsonbored/gittensory:sha256:existing" }],
+      rowCount: 1,
+    }); // merge-lookup query: an existing pending incremental for this repo
+    m.fn.mockResolvedValueOnce({ rows: [], rowCount: 1 }); // the guarded UPDATE wins the race — 1 row affected
+
+    await q.binding.send({
+      type: "rag-index-repo",
+      requestedBy: "webhook",
+      repoFullName: "JSONbored/gittensory",
+      paths: ["src/b.ts"],
+    });
+
+    expect(m.pool.query).toHaveBeenCalledWith(
+      expect.stringContaining("left(job_key, $1)=$2"),
+      ["rag-index-repo:jsonbored/gittensory:".length, "rag-index-repo:jsonbored/gittensory:", "rag-index-repo:jsonbored/gittensory:full"],
+    );
+    expect(m.pool.query).toHaveBeenCalledWith(
+      expect.stringContaining("SET payload=$1, run_after=GREATEST"),
+      expect.arrayContaining([
+        expect.stringContaining('"paths":["src/a.ts","src/b.ts"]'),
+        expect.any(Number),
+        expect.any(Number),
+        0,
+        expect.stringContaining("rag-index-repo:jsonbored/gittensory:sha256:"),
+        "existing-incremental",
+        "rag-index-repo:jsonbored/gittensory:sha256:existing",
+      ]),
+    );
+    expect(m.pool.query).not.toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO _selfhost_jobs (payload"),
+      expect.arrayContaining([expect.stringContaining('"paths":["src/b.ts"]')]),
+    );
+  });
+
+  it("REGRESSION (gate finding): a lost merge race (rowCount 0 — another instance claimed/mutated the row first) falls through to a normal insert instead of silently overwriting", async () => {
+    const m = makePool();
+    const q = createPgQueue(m.pool, async () => undefined);
+    await q.init();
+    m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // absorbedByKey check: no pending FULL job for this repo
+    m.fn.mockResolvedValueOnce({
+      rows: [{ id: "existing-incremental", payload: JSON.stringify({ type: "rag-index-repo", requestedBy: "webhook", repoFullName: "JSONbored/gittensory", paths: ["src/a.ts"] }), job_key: "rag-index-repo:jsonbored/gittensory:sha256:existing" }],
+      rowCount: 1,
+    }); // merge-lookup query: an existing pending incremental for this repo
+    m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // the guarded UPDATE LOSES the race — another instance already claimed/mutated this row
+
+    await q.binding.send({
+      type: "rag-index-repo",
+      requestedBy: "webhook",
+      repoFullName: "JSONbored/gittensory",
+      paths: ["src/b.ts"],
+    });
+
+    // Falls through to the normal enqueue path — a fresh INSERT for this job, never a second blind UPDATE
+    // against the same (already-claimed) row.
+    expect(m.pool.query).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO"),
+      expect.arrayContaining([expect.stringContaining('"paths":["src/b.ts"]')]),
+    );
+  });
+
+  it("does not merge an incremental into an already-pending FULL job for that repo", async () => {
+    const m = makePool();
+    const q = createPgQueue(m.pool, async () => undefined);
+    await q.init();
+    // absorbedByKey's own exact-match query finds the pending full job first, so the merge query never runs.
+    m.fn.mockResolvedValueOnce({ rows: [{ id: "existing-full" }], rowCount: 1 });
+
+    await q.binding.send({
+      type: "rag-index-repo",
+      requestedBy: "webhook",
+      repoFullName: "JSONbored/gittensory",
+      paths: ["src/a.ts"],
+    });
+
+    expect(m.pool.query).not.toHaveBeenCalledWith(
+      expect.stringContaining("left(job_key, $1)=$2"),
+      expect.anything(),
+    );
+  });
+
+  it("does not merge when the merge-lookup query finds no candidate (e.g. a different repo)", async () => {
+    const m = makePool();
+    const q = createPgQueue(m.pool, async () => undefined);
+    await q.init();
+    m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // absorbedByKey check: no pending FULL job
+    m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // merge-lookup query: no pending incremental either
+
+    await q.binding.send({
+      type: "rag-index-repo",
+      requestedBy: "webhook",
+      repoFullName: "JSONbored/gittensory",
+      paths: ["src/a.ts"],
+    });
+
+    expect(m.pool.query).toHaveBeenCalledWith(
+      expect.stringContaining("left(job_key, $1)=$2"),
+      [36, "rag-index-repo:jsonbored/gittensory:", "rag-index-repo:jsonbored/gittensory:full"],
+    );
+    expect(m.pool.query).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO _selfhost_jobs (payload"),
+      expect.arrayContaining([expect.stringContaining('"paths":["src/a.ts"]')]),
+    );
+  });
+
+  it("falls through to a separate row when merging would exceed the bounded path cap", async () => {
+    const m = makePool();
+    const q = createPgQueue(m.pool, async () => undefined);
+    await q.init();
+    m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // absorbedByKey check: no pending FULL job
+    m.fn.mockResolvedValueOnce({
+      rows: [{
+        id: "existing-at-cap",
+        payload: JSON.stringify({
+          type: "rag-index-repo",
+          requestedBy: "webhook",
+          repoFullName: "JSONbored/gittensory",
+          paths: Array.from({ length: 100 }, (_, i) => `src/${i}.ts`),
+        }),
+      }],
+      rowCount: 1,
+    }); // merge-lookup query: an existing pending incremental already at the cap
+
+    await q.binding.send({
+      type: "rag-index-repo",
+      requestedBy: "webhook",
+      repoFullName: "JSONbored/gittensory",
+      paths: ["src/extra.ts"],
+    });
+
+    // No merge (would be 101 paths, over the cap) -- falls through to a plain INSERT of its own row.
+    expect(m.pool.query).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO _selfhost_jobs (payload"),
+      expect.arrayContaining([expect.stringContaining('"paths":["src/extra.ts"]')]),
     );
   });
 
@@ -464,7 +727,6 @@ describe("createPgQueue (durable #977)", () => {
       expect.arrayContaining([
         expect.stringContaining('"type":"backfill-registered-repos"'),
         expect.any(Number),
-        expect.any(Number),
         0,
         "existing-backfill",
       ]),
@@ -473,7 +735,6 @@ describe("createPgQueue (durable #977)", () => {
       expect.stringContaining("SET payload=$1, run_after=GREATEST"),
       expect.arrayContaining([
         expect.stringContaining('"type":"generate-weekly-value-report"'),
-        expect.any(Number),
         expect.any(Number),
         0,
         "existing-report",
@@ -509,6 +770,107 @@ describe("createPgQueue (durable #977)", () => {
     await q.init();
     await q.drain();
     expect(seen).toEqual(["review"]);
+  });
+
+  it("PG connection resilience (#selfhost-pg-resilience): retries a transient connection error on the post-success DELETE, then succeeds", async () => {
+    const m = makePool();
+    m.enqueueJob("1", { type: "review" });
+    let deleteAttempts = 0;
+    let claimed = false;
+    (m.fn as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (sql: unknown) => {
+      const q = String(sql);
+      if (q.includes("DELETE FROM")) {
+        deleteAttempts += 1;
+        if (deleteAttempts < 2) {
+          const err = new Error("connection terminated") as Error & { code: string };
+          err.code = "ECONNRESET";
+          throw err;
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      if (q.includes("_selfhost_queue_fairness") && q.includes("RETURNING")) {
+        return { rows: [{ claim_sequence: 0, last_backlog_repo: null }], rowCount: 1 };
+      }
+      if (q.includes("RETURNING")) {
+        if (claimed) return { rows: [], rowCount: 0 };
+        claimed = true;
+        return { rows: [{ id: "1", payload: JSON.stringify({ type: "review" }), attempts: 0, job_key: null }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const seen: string[] = [];
+    const q = createPgQueue(m.pool, async (j) => void seen.push(typeOf(j)));
+    await q.init();
+    await q.drain();
+    expect(seen).toEqual(["review"]);
+    expect(deleteAttempts).toBe(2);
+  });
+
+  it("PG connection resilience: leaves the job in 'processing' (for reclaim) when the DELETE exhausts retries on a dead connection", async () => {
+    const m = makePool();
+    m.enqueueJob("1", { type: "review" });
+    let claimed = false;
+    (m.fn as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (sql: unknown) => {
+      const q = String(sql);
+      if (q.includes("DELETE FROM")) {
+        const err = new Error("connection terminated") as Error & { code: string };
+        err.code = "ECONNRESET";
+        throw err;
+      }
+      if (q.includes("_selfhost_queue_fairness") && q.includes("RETURNING")) {
+        return { rows: [{ claim_sequence: 0, last_backlog_repo: null }], rowCount: 1 };
+      }
+      if (q.includes("RETURNING")) {
+        if (claimed) return { rows: [], rowCount: 0 };
+        claimed = true;
+        return { rows: [{ id: "1", payload: JSON.stringify({ type: "review" }), attempts: 0, job_key: null }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const writes: string[] = [];
+    vi.mocked(process.stdout.write).mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    const q = createPgQueue(m.pool, async () => undefined);
+    await q.init();
+    await q.drain();
+    expect(writes.some((line) => line.includes('"event":"job_complete"'))).toBe(false);
+  });
+
+  it("PG connection resilience: a connection error thrown by the consumer itself is left for reclaim, not dead-lettered", async () => {
+    const m = makePool();
+    m.enqueueJob("1", { type: "review" });
+    const consume = vi.fn().mockImplementation(async () => {
+      const err = new Error("connection terminated") as Error & { code: string };
+      err.code = "57P01";
+      throw err;
+    });
+    const q = createPgQueue(m.pool, consume);
+    await q.init();
+    await q.drain();
+    // No dead-letter UPDATE (status='dead') or pending-retry UPDATE (attempts=$1) should have run for this job.
+    const calls = (m.fn as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => String(c[0]));
+    expect(calls.some((sql) => sql.includes("status='dead'"))).toBe(false);
+    expect(calls.some((sql) => sql.includes("attempts=$1, run_after=$2"))).toBe(false);
+  });
+
+  it("regression: a GENERIC network error from consume() (e.g. GitHub API, not Postgres) still goes through normal retry, not silent reclaim", async () => {
+    // ECONNRESET/ECONNREFUSED/EPIPE are NOT unique to Postgres -- consume() can throw them from its own
+    // unrelated network calls. Only unambiguous Postgres SQLSTATE codes should trigger the reclaim path here.
+    const m = makePool();
+    m.enqueueJob("1", { type: "review" });
+    const consume = vi.fn().mockImplementation(async () => {
+      const err = new Error("socket hang up") as Error & { code: string };
+      err.code = "ECONNRESET";
+      throw err;
+    });
+    const q = createPgQueue(m.pool, consume);
+    await q.init();
+    await q.drain();
+    const calls = (m.fn as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => String(c[0]));
+    // attempts=1 (first failure, under maxRetries) -> the normal pending-retry UPDATE must have run.
+    expect(calls.some((sql) => sql.includes("attempts=$1, run_after=$2"))).toBe(true);
   });
 
   it("copies carried webhook trace ids into job audit logs", async () => {
@@ -598,6 +960,209 @@ describe("createPgQueue (durable #977)", () => {
     );
   });
 
+  describe("claim-time backlog-vs-fresh-intake fairness (#selfhost-backlog-convergence)", () => {
+    const backlogJob = (repo: string, prNumber: number): JobMessage =>
+      ({
+        type: "agent-regate-pr",
+        deliveryId: `backlog-convergence:${repo}#${prNumber}`,
+        repoFullName: repo,
+        prNumber,
+        installationId: 1,
+      }) as unknown as JobMessage;
+
+    it("prefers a pending backlog-lane candidate at sequence 0 (default ratio) and records it as the last-served repo", async () => {
+      const claimSql: string[] = [];
+      let sequenceAllocations = 0;
+      let repoRecorded: string | null = null;
+      let claimed = false; // one-shot: the row is only claimable until the first successful claim
+      const fn = vi.fn().mockImplementation(async (sql: unknown, params?: unknown[]) => {
+        const q = String(sql);
+        // Atomic allocation (#selfhost-backlog-convergence review): a single UPDATE ... RETURNING, not a
+        // separate SELECT-then-UPDATE -- concurrent self-host instances sharing one Postgres must never be
+        // able to read the same pre-increment claim_sequence.
+        if (q.includes("UPDATE _selfhost_queue_fairness SET claim_sequence=claim_sequence+1") && q.includes("RETURNING claim_sequence, last_backlog_repo")) {
+          sequenceAllocations += 1;
+          return { rows: [{ claim_sequence: 0, last_backlog_repo: null }], rowCount: 1 };
+        }
+        if (q.includes("UPDATE _selfhost_queue_fairness SET last_backlog_repo")) {
+          repoRecorded = (params as [string])[0];
+          return { rows: [], rowCount: 1 };
+        }
+        if (q.includes("SELECT job_key, created_at") && q.includes("foreground_lane='backlog'")) {
+          return claimed ? { rows: [], rowCount: 0 } : { rows: [{ job_key: "agent-regate-pr:owner/repo#1", created_at: 1000 }], rowCount: 1 };
+        }
+        if (q.includes("UPDATE _selfhost_jobs SET status='processing'")) {
+          claimSql.push(q);
+          if (!claimed && q.includes("foreground_lane='backlog'")) {
+            expect((params as unknown[])[2]).toBe("agent-regate-pr:owner/repo#%");
+            claimed = true;
+            return {
+              rows: [{ id: "backlog-1", payload: JSON.stringify(backlogJob("owner/repo", 1)), attempts: 0, job_key: "agent-regate-pr:owner/repo#1", priority: 9, created_at: 1000 }],
+              rowCount: 1,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const seen: string[] = [];
+      const q = createPgQueue({ query: fn } as unknown as Pool, async (m) => void seen.push(typeOf(m)));
+
+      await q.init();
+      await q.drain();
+
+      expect(seen).toEqual(["agent-regate-pr"]);
+      expect(claimSql[0]).toContain("foreground_lane='backlog'");
+      expect(sequenceAllocations).toBeGreaterThan(0);
+      expect(repoRecorded).toBe("owner/repo");
+    });
+
+    it("falls through to the plain unscoped foreground claim when the backlog lane has no pending candidates", async () => {
+      const claimSql: string[] = [];
+      let claimed = false; // one-shot: the row is only claimable until the first successful claim
+      const fn = vi.fn().mockImplementation(async (sql: unknown) => {
+        const q = String(sql);
+        if (q.includes("UPDATE _selfhost_queue_fairness SET claim_sequence=claim_sequence+1") && q.includes("RETURNING claim_sequence, last_backlog_repo")) {
+          return { rows: [{ claim_sequence: 0, last_backlog_repo: null }], rowCount: 1 };
+        }
+        if (q.includes("UPDATE _selfhost_queue_fairness")) return { rows: [], rowCount: 1 };
+        if (q.includes("SELECT job_key, created_at") && q.includes("foreground_lane='backlog'")) {
+          return { rows: [], rowCount: 0 }; // no backlog work pending
+        }
+        if (q.includes("UPDATE _selfhost_jobs SET status='processing'")) {
+          claimSql.push(q);
+          if (!claimed && !q.includes("foreground_lane")) {
+            claimed = true;
+            return {
+              rows: [{ id: "fresh-1", payload: JSON.stringify(msg("recapture-preview")), attempts: 0, job_key: "recapture-preview:owner/repo#1:0", priority: 9, created_at: 1000 }],
+              rowCount: 1,
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const seen: string[] = [];
+      const q = createPgQueue({ query: fn } as unknown as Pool, async (m) => void seen.push(typeOf(m)));
+
+      await q.init();
+      await q.drain();
+
+      // The backlog-scoped claim yields nothing (no candidates) -- falls through to the unscoped foreground
+      // query, which still finds the untagged foreground row rather than stalling.
+      expect(seen).toEqual(["recapture-preview"]);
+      expect(claimSql[0]).not.toContain("foreground_lane");
+    });
+
+    it("allocates the claim sequence atomically via UPDATE ... RETURNING, not a separate SELECT-then-UPDATE (#selfhost-backlog-convergence review)", async () => {
+      // A stateful counter mimics what Postgres's own row lock guarantees: each call to the fairness UPDATE
+      // sees the PRIOR call's committed increment, never a stale pre-increment value two callers could both
+      // observe. If the code ever regressed to a separate SELECT-then-UPDATE, this mock would not by itself
+      // catch a real race (it's still single-threaded JS) -- what it DOES prove is that the code reads its
+      // lane decision from the SAME query that performs the increment (the RETURNING clause), which is the
+      // actual fix: no separate read exists to go stale between two real concurrent Postgres connections.
+      let claimSequence = 0;
+      const claimedRepoJobs = new Set(["1", "2"]);
+      const fn = vi.fn().mockImplementation(async (sql: unknown) => {
+        const q = String(sql);
+        if (q.includes("UPDATE _selfhost_queue_fairness SET claim_sequence=claim_sequence+1") && q.includes("RETURNING claim_sequence, last_backlog_repo")) {
+          claimSequence += 1;
+          return { rows: [{ claim_sequence: claimSequence, last_backlog_repo: null }], rowCount: 1 };
+        }
+        if (q.includes("UPDATE _selfhost_queue_fairness")) return { rows: [], rowCount: 1 };
+        if (q.includes("SELECT job_key, created_at") && q.includes("foreground_lane='backlog'")) {
+          return {
+            rows: [...claimedRepoJobs].map((n) => ({ job_key: `agent-regate-pr:owner/repo#${n}`, created_at: 1000 })),
+            rowCount: claimedRepoJobs.size,
+          };
+        }
+        if (q.includes("UPDATE _selfhost_jobs SET status='processing'") && q.includes("foreground_lane='backlog'")) {
+          const next = [...claimedRepoJobs][0];
+          if (next === undefined) return { rows: [], rowCount: 0 };
+          claimedRepoJobs.delete(next);
+          return {
+            rows: [{ id: `backlog-${next}`, payload: JSON.stringify(backlogJob("owner/repo", Number(next))), attempts: 0, job_key: `agent-regate-pr:owner/repo#${next}`, priority: 9, created_at: 1000 }],
+            rowCount: 1,
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const seen: string[] = [];
+      const q = createPgQueue({ query: fn } as unknown as Pool, async (m) => void seen.push(typeOf(m)), { concurrency: 1 });
+
+      await q.init();
+      await q.drain();
+
+      // 2 backlog-tagged rows are pending; the fairness allocator's RETURNING values (1, then 2 -- both
+      // < the default ratio's backlogPer=3 window) both resolve to "backlog", so both rows are claimed via
+      // the backlog-scoped path in order, proving the lane decision tracks the atomically-allocated sequence
+      // rather than a stale value from a separate read. (drain() keeps polling after both are claimed until a
+      // claim genuinely comes up empty, so the allocator may advance past 2 -- that trailing empty cycle is
+      // not what this test is verifying.)
+      expect(seen).toEqual(["agent-regate-pr", "agent-regate-pr"]);
+      expect(claimSequence).toBeGreaterThanOrEqual(2);
+    });
+
+    it("backfills the foreground_lane column on startup for jobs enqueued by an older version", async () => {
+      const m = makePool();
+      m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // DDL
+      m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // fairness singleton INSERT
+      m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // priority backfill SELECT
+      m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // job-key backfill SELECT
+      m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // maintenance-flags backfill SELECT
+      m.fn.mockResolvedValueOnce({
+        rows: [{ id: "legacy", payload: JSON.stringify({ type: "agent-regate-pr", deliveryId: "backlog-convergence:owner/repo#1" }), foreground_lane: null }],
+        rowCount: 1,
+      }); // foreground-lane backfill SELECT
+      m.fn.mockResolvedValueOnce({ rows: [], rowCount: 1 }); // the backfill UPDATE for the legacy row
+      m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // recovery UPDATE
+      const q = createPgQueue(m.pool, async () => undefined);
+      await q.init();
+      expect(m.pool.query).toHaveBeenCalledWith(
+        expect.stringContaining("UPDATE _selfhost_jobs SET foreground_lane=$1"),
+        ["backlog", "legacy"],
+      );
+    });
+  });
+
+  it("REGRESSION: releases the reserved background slot when a background claim query rejects (#selfhost-bg-slot-leak)", async () => {
+    // A raw pool failure during the BACKGROUND claim (a dropped connection / lock timeout — the exact failures
+    // pump() is documented to catch) rejects out of claimNext(), which runs OUTSIDE processOne's try/finally, so
+    // its reserved slot must be rolled back. Without the rollback the slot leaks; since backgroundConcurrency
+    // defaults to 1, a single such error would starve the entire background/maintenance lane until a restart.
+    // Assert the lane still drains a background job after one rejected claim.
+    const m = makePool();
+    let failNextBackgroundClaim = true;
+    const pool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const q = String(sql);
+        if (failNextBackgroundClaim && q.includes("UPDATE _selfhost_jobs SET status='processing'") && q.includes("priority < $2")) {
+          failNextBackgroundClaim = false;
+          throw new Error("connection terminated unexpectedly");
+        }
+        return (m.pool as unknown as { query(sql: unknown, params?: unknown[]): Promise<unknown> }).query(q, params);
+      },
+    } as unknown as Pool;
+    const seen: string[] = [];
+    const q = createPgQueue(pool, async (j) => void seen.push(typeOf(j)), { backgroundConcurrency: 1 });
+    await q.init();
+
+    // First drain: foreground claim empty, background claim rejects (transient). pump() catches it; the reserved
+    // slot must be released so the lane is not permanently starved.
+    m.enqueueResult({ rows: [], rowCount: 0 }); // foreground claim → empty
+    await q.drain();
+    expect(seen).toEqual([]);
+
+    // Second drain: the lane must have recovered — foreground empty, background claim returns the job.
+    m.enqueueResult({ rows: [], rowCount: 0 }); // foreground claim → empty
+    m.enqueueResult({
+      rows: [{ id: "background", payload: JSON.stringify(msg("agent-regate-sweep")), attempts: 0, job_key: "agent-regate-sweep", priority: 0 }],
+      rowCount: 1,
+    }); // background claim → job
+    await q.drain();
+    expect(seen).toEqual(["agent-regate-sweep"]);
+  });
+
   it("pre-yields GitHub-budget background jobs when the persisted REST budget is reserved", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-06-24T12:00:00.000Z"));
@@ -608,7 +1173,7 @@ describe("createPgQueue (durable #977)", () => {
       m.setRateLimitRows([{ admission_key: "installation:123", repo_full_name: "owner/other-repo", remaining: "120", reset_at: "2026-06-24T12:10:00.000Z", observed_at: "2026-06-24T11:59:30.000Z" }]);
       m.enqueueJob("background", {
         type: "agent-regate-pr",
-        deliveryId: "sweep:owner/repo#7",
+        deliveryId: "regate-sweep:owner/repo#7",
         repoFullName: "owner/repo",
         prNumber: 7,
         installationId: 123,
@@ -628,6 +1193,47 @@ describe("createPgQueue (durable #977)", () => {
         ["gittensory_jobs_rate_limit_deferred_total", 1],
       );
       expect(await renderMetrics()).toContain('gittensory_jobs_rate_limit_admission_deferred_total{job_type="agent-regate-pr",key_scope="installation",kind="background"} 1');
+    } finally {
+      if (oldJitter === undefined) delete process.env.QUEUE_RATE_LIMIT_JITTER_MS;
+      else process.env.QUEUE_RATE_LIMIT_JITTER_MS = oldJitter;
+    }
+  });
+
+  it("PG connection resilience: a still-dead connection on the rate-limit-defer UPDATE doesn't crash the pump loop (other claimable jobs still run)", async () => {
+    // Regression: an uncaught throw here used to escape processOne() entirely and land in pump()'s own
+    // catch (see pump()'s "selfhost_queue_pump_crashed"), which ALSO breaks pump()'s `while (await
+    // processOne())` loop -- so a SECOND already-claimable job enqueued in the same batch would be left
+    // unprocessed until the next kick, not just this one job's own retry being deferred.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-06-24T12:00:00.000Z"));
+    const oldJitter = process.env.QUEUE_RATE_LIMIT_JITTER_MS;
+    process.env.QUEUE_RATE_LIMIT_JITTER_MS = "0";
+    try {
+      const m = makePool();
+      m.setRateLimitRows([{ admission_key: "installation:123", repo_full_name: "owner/other-repo", remaining: "120", reset_at: "2026-06-24T12:10:00.000Z", observed_at: "2026-06-24T11:59:30.000Z" }]);
+      m.enqueueJob("background", {
+        type: "agent-regate-pr",
+        deliveryId: "regate-sweep:owner/repo#7",
+        repoFullName: "owner/repo",
+        prNumber: 7,
+        installationId: 123,
+      });
+      m.enqueueJob("second", { type: "review" });
+      const original = (m.fn as unknown as ReturnType<typeof vi.fn>).getMockImplementation() as (sql: unknown, params?: unknown[]) => Promise<unknown>;
+      (m.fn as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (sql: unknown, params?: unknown[]) => {
+        if (String(sql).includes("SET status='pending', run_after=GREATEST")) {
+          const err = new Error("connection terminated") as Error & { code: string };
+          err.code = "ECONNRESET";
+          throw err;
+        }
+        return original(sql, params);
+      });
+      const seen: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void seen.push(typeOf(j)));
+      await q.drain();
+      // The second job must still be processed in the same drain() call, proving the pump() while-loop
+      // continued past the first job's connection-loss instead of throwing out of it entirely.
+      expect(seen).toEqual(["review"]);
     } finally {
       if (oldJitter === undefined) delete process.env.QUEUE_RATE_LIMIT_JITTER_MS;
       else process.env.QUEUE_RATE_LIMIT_JITTER_MS = oldJitter;
@@ -1031,6 +1637,271 @@ describe("createPgQueue (durable #977)", () => {
       } finally {
         delete process.env.QUEUE_DEAD_LETTER_REVIVE_INTERVAL_MS;
       }
+    });
+  });
+
+  describe("releaseStaleForegroundDeferrals (#selfhost-queue-liveness)", () => {
+    afterEach(() => {
+      delete process.env.FOREGROUND_LIVENESS_ENABLED;
+      delete process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS;
+    });
+
+    it("releases a foreground-priority pending row deferred far into the future once its created_at is stale", async () => {
+      process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS = "60000"; // 1m (parsePositiveIntEnv floor)
+      const m = makePool();
+      const now = Date.now();
+      // priority>=8 (foreground), run_after far in the future, created_at old enough to cross the 1m ceiling.
+      m.setForegroundLivenessCandidates([{ id: "fg-1", created_at: now - 61_000 }]);
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(1);
+      expect(m.fn).toHaveBeenCalledWith(
+        expect.stringContaining("SELECT id, payload, created_at FROM _selfhost_jobs WHERE status='pending' AND priority>=$1 AND run_after>$2"),
+        expect.arrayContaining([8]),
+      );
+      expect(m.fn).toHaveBeenCalledWith(
+        expect.stringContaining("SET run_after=$1 WHERE id=$2 AND status='pending' AND run_after>$1"),
+        expect.arrayContaining(["fg-1"]),
+      );
+      expect(await renderMetrics()).toContain("gittensory_jobs_foreground_liveness_released_total 1");
+    });
+
+    // Isolates the AGE condition from the OR'd rate-limit-clear condition: the default candidate payload
+    // (recapture-preview) is always rate-limit-"clear" (see setForegroundLivenessCandidates' own doc comment),
+    // so this test uses a github-webhook payload WITH a genuinely exhausted, still-future-reset observation for
+    // its admission key, ensuring isRateLimitAdmissionNowClear() returns false and only the age check governs.
+    it("does NOT release a foreground row whose created_at is still recent (not yet stale) AND is still genuinely rate-limited", async () => {
+      process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS = "600000"; // default 10m
+      const m = makePool();
+      const now = Date.now();
+      m.setRateLimitRows([
+        {
+          admission_key: "installation:123",
+          remaining: 1,
+          reset_at: new Date(now + 30 * 60_000).toISOString(),
+          observed_at: new Date(now).toISOString(),
+        },
+      ]);
+      const payload = JSON.stringify({
+        type: "github-webhook",
+        deliveryId: "still-blocked",
+        eventName: "x",
+        payload: { installation: { id: 123 } },
+      });
+      // Same shape as the stale case (foreground priority, future run_after) but created_at is only 1s old.
+      m.setForegroundLivenessCandidates([{ id: "fg-fresh", created_at: now - 1_000, payload }]);
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(0);
+      expect(m.fn).not.toHaveBeenCalledWith(
+        expect.stringContaining("SET run_after=$1 WHERE id=$2 AND status='pending' AND run_after>$1"),
+        expect.arrayContaining(["fg-fresh"]),
+      );
+      expect(await renderMetrics()).not.toContain("gittensory_jobs_foreground_liveness_released_total");
+    });
+
+    // CONDITION-BASED recovery (the second OR arm): a foreground job whose created_at is nowhere near stale but
+    // whose rate-limit observation has since cleared (no blocking observation seeded here) is released anyway --
+    // the whole point of pairing the age floor with a rate-limit-aware re-check (see the source's own doc
+    // comment on releaseStaleForegroundDeferrals).
+    it("releases a foreground row that is NOT yet age-stale once rate-limit admission for it reads clear", async () => {
+      process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS = "600000"; // default 10m -- nowhere near stale by age
+      const m = makePool();
+      const now = Date.now();
+      const payload = JSON.stringify({
+        type: "github-webhook",
+        deliveryId: "now-clear",
+        eventName: "x",
+        payload: { installation: { id: 123 } },
+      });
+      // No rate-limit rows seeded at all -- rateLimitAdmissionDelayMs degrades to "clear".
+      m.setForegroundLivenessCandidates([{ id: "fg-clear", created_at: now - 1_000, payload }]);
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(1);
+      expect(await renderMetrics()).toContain("gittensory_jobs_foreground_liveness_released_total 1");
+    });
+
+    // The payload is unparseable -- isRateLimitAdmissionNowClear's own catch(){ return false } branch -- so ONLY
+    // the age condition can release it; while young, it must stay parked exactly like any other not-yet-stale,
+    // still-blocked row.
+    it("does NOT release a foreground row with an unparseable payload before it is age-stale", async () => {
+      process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS = "600000";
+      const m = makePool();
+      const now = Date.now();
+      m.setForegroundLivenessCandidates([{ id: "fg-bad-json", created_at: now - 1_000, payload: "not valid json" }]);
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(0);
+    });
+
+    // The priority>=$1 filter is enforced by the candidate SELECT's own WHERE clause (bound to
+    // FOREGROUND_QUEUE_PRIORITY_FLOOR=8), not by any application-side check on the returned rows -- mirrors how
+    // the maintenance-admission pressure tests in this file assert the is_maintenance=1 predicate is present in
+    // the issued SQL rather than re-deriving it from mock row shapes. Asserting the bind param here is the
+    // faithful way to prove a background-priority (<8) row is structurally excluded from ever being considered.
+    it("scopes the candidate SELECT to foreground priority via the FOREGROUND_QUEUE_PRIORITY_FLOOR bind param", async () => {
+      const m = makePool();
+      m.setForegroundLivenessCandidates([]); // the real WHERE priority>=8 excludes a background row; assert the bind param enforces it
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(0);
+      expect(m.fn).toHaveBeenCalledWith(
+        expect.stringContaining("priority>=$1"),
+        expect.arrayContaining([8]),
+      );
+    });
+
+    it("returns 0 immediately without issuing the candidate SELECT when FOREGROUND_LIVENESS_ENABLED=false", async () => {
+      process.env.FOREGROUND_LIVENESS_ENABLED = "false";
+      const m = makePool();
+      const now = Date.now();
+      m.setForegroundLivenessCandidates([{ id: "fg-1", created_at: now - 10 * 60_000 }]);
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(0);
+      expect(m.fn).not.toHaveBeenCalledWith(
+        expect.stringContaining("SELECT id, payload, created_at FROM _selfhost_jobs WHERE status='pending' AND priority>=$1 AND run_after>$2"),
+        expect.anything(),
+      );
+      expect(await renderMetrics()).not.toContain("gittensory_jobs_foreground_liveness_released_total");
+    });
+
+    // REGRESSION (#selfhost-queue-liveness): the production incident this module exists to make structurally
+    // impossible -- a GitHub rate-limit sweep pushes MANY foreground-priority jobs' run_after far into the
+    // future at once (a shared REST budget drained by a post-deploy catch-up burst), and without this release
+    // path they'd sit deferred for up to the ~65-minute worst-case rate-limit window with zero runnable work,
+    // requiring manual intervention. Assert releaseStaleForegroundDeferrals() releases ALL stale rows in ONE
+    // sweep (not just the first) and records the metric as a SINGLE aggregate increment, not one per row --
+    // matching the source's own "logs + records a metric ONCE per sweep (aggregate count), not per row" doc
+    // comment, which exists specifically so a large release batch cannot spam the log/metric.
+    it("releases every stale foreground deferral in one sweep and records one aggregate metric increment (regression for #selfhost-queue-liveness)", async () => {
+      process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS = "60000"; // 1m floor
+      const m = makePool();
+      const now = Date.now();
+      const staleAge = now - 5 * 60_000; // 5m old -- well past the 1m ceiling
+      m.setForegroundLivenessCandidates([
+        { id: "stuck-1", created_at: staleAge },
+        { id: "stuck-2", created_at: staleAge },
+        { id: "stuck-3", created_at: staleAge },
+      ]);
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(3);
+      for (const id of ["stuck-1", "stuck-2", "stuck-3"]) {
+        expect(m.fn).toHaveBeenCalledWith(
+          expect.stringContaining("SET run_after=$1 WHERE id=$2 AND status='pending' AND run_after>$1"),
+          expect.arrayContaining([id]),
+        );
+      }
+      // Exactly one aggregate increment of 3, not three separate increments of 1.
+      expect(await renderMetrics()).toContain("gittensory_jobs_foreground_liveness_released_total 3");
+    });
+
+    // Ramp-up cap (#selfhost-queue-liveness): a large inherited backlog (the production incident had ~190
+    // over-deferred rows) must not release ALL of it in one sweep -- that many jobs re-attempting GitHub reads
+    // at once can immediately re-trip the same rate-limit bucket they were deferred for. With the cap set
+    // below the eligible count, assert only `cap` rows get their UPDATE issued, and that the OLDEST rows
+    // (smallest created_at) are the ones chosen.
+    it("caps releases at FOREGROUND_LIVENESS_MAX_RELEASE_PER_SWEEP, releasing the oldest rows first", async () => {
+      process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS = "60000"; // 1m floor
+      process.env.FOREGROUND_LIVENESS_MAX_RELEASE_PER_SWEEP = "2";
+      const m = makePool();
+      const now = Date.now();
+      // 4 stale-eligible rows at distinct ages; only the 2 OLDEST should be released.
+      m.setForegroundLivenessCandidates([
+        { id: "oldest", created_at: now - 10 * 60_000 },
+        { id: "second-oldest", created_at: now - 8 * 60_000 },
+        { id: "newer", created_at: now - 6 * 60_000 },
+        { id: "newest", created_at: now - 5 * 60_000 },
+      ]);
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(2);
+      for (const id of ["oldest", "second-oldest"]) {
+        expect(m.fn).toHaveBeenCalledWith(
+          expect.stringContaining("SET run_after=$1 WHERE id=$2 AND status='pending' AND run_after>$1"),
+          expect.arrayContaining([id]),
+        );
+      }
+      for (const id of ["newer", "newest"]) {
+        expect(m.fn).not.toHaveBeenCalledWith(
+          expect.stringContaining("SET run_after=$1 WHERE id=$2 AND status='pending' AND run_after>$1"),
+          expect.arrayContaining([id]),
+        );
+      }
+      expect(await renderMetrics()).toContain("gittensory_jobs_foreground_liveness_released_total 2");
+      delete process.env.FOREGROUND_LIVENESS_MAX_RELEASE_PER_SWEEP;
+    });
+
+    // A stale candidate can lose the UPDATE race (another instance/tick already moved it) -- mirrors
+    // reviveDeadLetterJobs' own "AND status='dead'" re-check pattern: only rows whose UPDATE actually matched
+    // (rowCount 1) count toward the release total, never the raw SELECT candidate count.
+    it("counts only rows whose conditional UPDATE actually matched, not the raw candidate count", async () => {
+      process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS = "60000";
+      const m = makePool();
+      const now = Date.now();
+      const staleAge = now - 5 * 60_000;
+      m.setForegroundLivenessCandidates(
+        [
+          { id: "won-race", created_at: staleAge },
+          { id: "lost-race", created_at: staleAge },
+        ],
+        [1, 0], // second row's UPDATE matches zero rows -- already released/claimed by someone else
+      );
+      const q = createPgQueue(m.pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(1);
+    });
+
+    it("handles a null rowCount from the release UPDATE (rowCount ?? 0 nullish arm)", async () => {
+      process.env.FOREGROUND_LIVENESS_MAX_DEFER_MS = "60000";
+      const now = Date.now();
+      // pg's driver can report a null rowCount for some UPDATEs; the release count must tolerate it rather
+      // than propagate NaN (mirrors init()'s own "handles null rowCount from the recovery query" test).
+      const fn = vi.fn().mockImplementation(async (sql: unknown) => {
+        const q = String(sql);
+        if (q.includes("SELECT id, payload, created_at FROM") && q.includes("priority>=$1 AND run_after>$2")) {
+          return { rows: [{ id: "fg-null", created_at: now - 5 * 60_000 }], rowCount: 1 };
+        }
+        if (q.includes("SET run_after=$1 WHERE id=$2 AND status='pending' AND run_after>$1")) {
+          return { rows: [], rowCount: null };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      const q = createPgQueue({ query: fn } as unknown as Pool, async () => undefined);
+
+      const released = await q.releaseStaleForegroundDeferrals();
+
+      expect(released).toBe(0); // null ?? 0 -- no metric recorded, no crash
+      expect(await renderMetrics()).not.toContain("gittensory_jobs_foreground_liveness_released_total");
+    });
+  });
+
+  describe("processingCount (#selfhost-queue-liveness)", () => {
+    it("returns the count of status='processing' jobs", async () => {
+      const { pool } = makePool();
+      // makePool returns { c: "3" } for any COUNT(*) query, including WHERE status='processing'.
+      const q = createPgQueue(pool, async () => undefined);
+      expect(await q.processingCount()).toBe(3);
     });
   });
 
@@ -1591,5 +2462,231 @@ describe("createPgQueue (durable #977)", () => {
       ]),
     );
     expect(bindingSnapshot).toEqual(snapshot);
+  });
+
+  describe("maintenance-admission pressure gating (#selfhost-runtime-pressure)", () => {
+    const now = Date.now();
+    const maintenanceRow = { id: "m1", payload: JSON.stringify(msg("build-contributor-evidence")), attempts: 0, job_key: "build-contributor-evidence:all", priority: 0, created_at: now };
+
+    it("defers a maintenance job when live queue pressure is high", async () => {
+      const m = makePool();
+      m.setPressureSignals({ live: { cnt: 6, oldest: now } }); // default threshold is 5
+      m.enqueueResult({ rows: [], rowCount: 0 }); // empty foreground claim
+      m.enqueueResult({ rows: [maintenanceRow], rowCount: 1 }); // background claim
+      const started: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+      await q.drain();
+
+      expect(started).not.toContain("build-contributor-evidence");
+      expect(m.pool.query).toHaveBeenCalledWith(
+        expect.stringContaining("SET status='pending', run_after=GREATEST"),
+        expect.arrayContaining([expect.stringContaining("live_pending_high")]),
+      );
+      expect(await renderMetrics()).toContain(
+        'gittensory_jobs_maintenance_admission_deferred_by_reason_total{job_type="build-contributor-evidence",reason="live_pending_high"} 1',
+      );
+    });
+
+    it("admits a maintenance job immediately when pressure is clear", async () => {
+      const m = makePool();
+      m.enqueueResult({ rows: [], rowCount: 0 }); // empty foreground claim
+      m.enqueueResult({ rows: [maintenanceRow], rowCount: 1 }); // background claim
+      const started: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+      await q.drain();
+      expect(started).toEqual(["build-contributor-evidence"]);
+    });
+
+    it("never defers a foreground job even under maintenance-triggering pressure", async () => {
+      const m = makePool();
+      m.setPressureSignals({ live: { cnt: 6, oldest: now } });
+      m.enqueueResult({
+        rows: [{ id: "w1", payload: JSON.stringify(msg("github-webhook")), attempts: 0, job_key: null, priority: 10, created_at: now }],
+        rowCount: 1,
+      });
+      const started: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+      await q.drain();
+      expect(started).toEqual(["github-webhook"]);
+    });
+
+    it("defers a maintenance job when the maintenance lane itself is backed up", async () => {
+      const m = makePool();
+      m.setPressureSignals({ maintenance: { cnt: 16, oldest: now } }); // default threshold is 15
+      m.enqueueResult({ rows: [], rowCount: 0 });
+      m.enqueueResult({ rows: [maintenanceRow], rowCount: 1 });
+      const started: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+      await q.drain();
+      expect(started).not.toContain("build-contributor-evidence");
+    });
+
+    it("defers a maintenance job when the backlog-convergence lane is high (#selfhost-backlog-convergence)", async () => {
+      const m = makePool();
+      m.setPressureSignals({ backlogConvergence: { cnt: 11 } }); // default threshold is 10
+      m.enqueueResult({ rows: [], rowCount: 0 });
+      m.enqueueResult({ rows: [maintenanceRow], rowCount: 1 });
+      const started: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+      await q.drain();
+      expect(started).not.toContain("build-contributor-evidence");
+      expect(await renderMetrics()).toContain(
+        'gittensory_jobs_maintenance_admission_deferred_by_reason_total{job_type="build-contributor-evidence",reason="backlog_convergence_high"} 1',
+      );
+    });
+
+    it("never defers a foreground job even under backlog-convergence-triggering pressure", async () => {
+      const m = makePool();
+      m.setPressureSignals({ backlogConvergence: { cnt: 11 } });
+      m.enqueueResult({
+        rows: [{ id: "w1", payload: JSON.stringify(msg("github-webhook")), attempts: 0, job_key: null, priority: 10, created_at: now }],
+        rowCount: 1,
+      });
+      const started: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+      await q.drain();
+      expect(started).toEqual(["github-webhook"]);
+    });
+
+    // Regression (#selfhost-maintenance-self-pin): mirrors selfhost-sqlite-queue.test.ts exactly -- a large
+    // backlog (well over threshold) no longer denies EVERY job forever; a job old enough for the drain age gets
+    // admitted while a fresh job in the SAME backlog still defers.
+    it("drain-admits an old job in a large backlog once it has waited past the drain age, while a fresh job in the SAME backlog still defers", async () => {
+      const oldEnv = process.env.MAINTENANCE_ADMISSION_DRAIN_AGE_MS;
+      process.env.MAINTENANCE_ADMISSION_DRAIN_AGE_MS = "60000"; // 1m (parsePositiveIntEnv floor)
+      try {
+        const m = makePool();
+        m.setPressureSignals({ maintenance: { cnt: 68, oldest: now } }); // mirrors the reported incident's backlog size
+        m.enqueueResult({ rows: [], rowCount: 0 }); // empty foreground claim
+        m.enqueueResult({ rows: [{ ...maintenanceRow, created_at: now - 61_000 }], rowCount: 1 }); // old job: drained
+        const started: string[] = [];
+        const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+        await q.drain();
+        expect(started).toEqual(["build-contributor-evidence"]);
+        expect(await renderMetrics()).toContain(
+          'gittensory_jobs_maintenance_admission_granted_under_pressure_total{job_type="build-contributor-evidence",reason="maintenance_pending_high_drain"} 1',
+        );
+      } finally {
+        if (oldEnv === undefined) delete process.env.MAINTENANCE_ADMISSION_DRAIN_AGE_MS;
+        else process.env.MAINTENANCE_ADMISSION_DRAIN_AGE_MS = oldEnv;
+      }
+    });
+
+    it("does not drain-admit when host load is ALSO high", async () => {
+      const oldEnv = process.env.MAINTENANCE_ADMISSION_DRAIN_AGE_MS;
+      process.env.MAINTENANCE_ADMISSION_DRAIN_AGE_MS = "60000";
+      vi.mocked(hostLoadAvg1PerCore).mockReturnValue(5);
+      try {
+        const m = makePool();
+        m.setPressureSignals({ maintenance: { cnt: 68, oldest: now } });
+        m.enqueueResult({ rows: [], rowCount: 0 });
+        m.enqueueResult({ rows: [{ ...maintenanceRow, created_at: now - 61_000 }], rowCount: 1 });
+        const started: string[] = [];
+        const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+        await q.drain();
+        expect(started).not.toContain("build-contributor-evidence");
+        expect(m.pool.query).toHaveBeenCalledWith(
+          expect.stringContaining("SET status='pending', run_after=GREATEST"),
+          expect.arrayContaining([expect.stringContaining("host_load_high")]),
+        );
+      } finally {
+        if (oldEnv === undefined) delete process.env.MAINTENANCE_ADMISSION_DRAIN_AGE_MS;
+        else process.env.MAINTENANCE_ADMISSION_DRAIN_AGE_MS = oldEnv;
+      }
+    });
+
+    it("defers a maintenance job when host load per core is high", async () => {
+      vi.mocked(hostLoadAvg1PerCore).mockReturnValue(5);
+      const m = makePool();
+      m.enqueueResult({ rows: [], rowCount: 0 });
+      m.enqueueResult({ rows: [maintenanceRow], rowCount: 1 });
+      const started: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+      await q.drain();
+      expect(started).not.toContain("build-contributor-evidence");
+    });
+
+    it("force-admits via trickle once a maintenance job has waited past the max defer age", async () => {
+      const oldEnv = process.env.MAINTENANCE_ADMISSION_MAX_DEFER_AGE_MS;
+      process.env.MAINTENANCE_ADMISSION_MAX_DEFER_AGE_MS = "60000"; // 1m (parsePositiveIntEnv floor)
+      try {
+        const m = makePool();
+        m.setPressureSignals({ live: { cnt: 6, oldest: now } });
+        m.enqueueResult({ rows: [], rowCount: 0 });
+        m.enqueueResult({
+          rows: [{ ...maintenanceRow, created_at: now - 61_000 }],
+          rowCount: 1,
+        });
+        const started: string[] = [];
+        const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+        await q.drain();
+        expect(started).toEqual(["build-contributor-evidence"]);
+        const metrics = await renderMetrics();
+        expect(metrics).toContain('gittensory_jobs_maintenance_trickle_admitted_by_type_total{job_type="build-contributor-evidence"} 1');
+        expect(metrics).toContain('gittensory_jobs_maintenance_admission_granted_under_pressure_total{job_type="build-contributor-evidence",reason="trickle_max_defer_age"} 1');
+      } finally {
+        if (oldEnv === undefined) delete process.env.MAINTENANCE_ADMISSION_MAX_DEFER_AGE_MS;
+        else process.env.MAINTENANCE_ADMISSION_MAX_DEFER_AGE_MS = oldEnv;
+      }
+    });
+
+    it("does not record the granted-under-pressure metric for an ordinary pressure_clear admission", async () => {
+      const m = makePool();
+      m.enqueueResult({ rows: [], rowCount: 0 });
+      m.enqueueResult({ rows: [maintenanceRow], rowCount: 1 });
+      const started: string[] = [];
+      const q = createPgQueue(m.pool, async (j) => void started.push(typeOf(j)));
+      await q.drain();
+      expect(started).toEqual(["build-contributor-evidence"]);
+      expect(await renderMetrics()).not.toContain("gittensory_jobs_maintenance_admission_granted_under_pressure_total");
+    });
+
+    it("pressureSignals() surfaces the live, maintenance, and backlog-convergence aggregate reads", async () => {
+      const m = makePool();
+      m.setPressureSignals({
+        live: { cnt: 2, oldest: now - 1_000 },
+        maintenance: { cnt: 4, oldest: now - 2_000 },
+        backlogConvergence: { cnt: 3 },
+      });
+      const q = createPgQueue(m.pool, async () => undefined);
+      const signals = await q.pressureSignals();
+      expect(signals).toEqual({
+        livePendingCount: 2,
+        oldestLivePendingAgeMs: expect.any(Number),
+        liveRunnableNowCount: 0,
+        oldestLiveRunnableAgeMs: null,
+        maintenancePendingCount: 4,
+        oldestMaintenancePendingAgeMs: expect.any(Number),
+        backlogConvergencePendingCount: 3,
+        hostLoadAvg1PerCore: null,
+      });
+    });
+
+    // #selfhost-queue-liveness: liveRunnableNowCount/oldestLiveRunnableAgeMs must reflect only the SUBSET of
+    // live pending jobs that are currently DUE (run_after<=now) -- distinct from livePendingCount/
+    // oldestLivePendingAgeMs, which are dominated by whatever row is OLDEST by created_at regardless of
+    // whether it is runnable right now. A stale/deferred oldest row must not mask a younger due row.
+    it("pressureSignals() reports the runnable-now subset distinctly from the overall oldest-pending age", async () => {
+      const m = makePool();
+      m.setPressureSignals({
+        live: { cnt: 3, oldest: now - 500_000, runnableCnt: 1, oldestRunnable: now - 10_000 },
+      });
+      const q = createPgQueue(m.pool, async () => undefined);
+      const signals = await q.pressureSignals();
+      expect(signals.livePendingCount).toBe(3);
+      expect(signals.oldestLivePendingAgeMs).toBeGreaterThanOrEqual(500_000);
+      expect(signals.liveRunnableNowCount).toBe(1);
+      expect(signals.oldestLiveRunnableAgeMs).toBeGreaterThanOrEqual(10_000);
+      expect(signals.oldestLiveRunnableAgeMs).toBeLessThan(signals.oldestLivePendingAgeMs as number);
+    });
+
+    it("pressureSignals() reports zero runnable-now and a null oldest-runnable age when every live row is deferred to the future", async () => {
+      const m = makePool();
+      m.setPressureSignals({ live: { cnt: 5, oldest: now - 100_000, runnableCnt: 0, oldestRunnable: null } });
+      const q = createPgQueue(m.pool, async () => undefined);
+      const signals = await q.pressureSignals();
+      expect(signals.liveRunnableNowCount).toBe(0);
+      expect(signals.oldestLiveRunnableAgeMs).toBeNull();
+    });
   });
 });

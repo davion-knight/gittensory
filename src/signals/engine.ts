@@ -26,13 +26,14 @@ import type { GittensorContributorSnapshot } from "../gittensor/api";
 import { nowIso } from "../utils/json";
 import { sanitizePublicComment } from "../queue-intelligence";
 import { labelMatchesPattern, projectLinkedIssueMultiplierForPlannedSolve, type LinkedIssueMultiplierStatus } from "../scoring/preview";
-import { hasLocalTestEvidence } from "./test-evidence";
+import { hasLocalTestEvidence, isTestPath } from "./test-evidence";
 import { isFailingCheckSummary } from "./local-branch";
 import { isDuplicateClusterWinnerByClaim } from "./duplicate-winner";
 import { PREFLIGHT_LIMITS } from "./preflight-limits";
 import type { UnifiedCollapsible } from "../review/unified-comment";
 import { splitAiReviewNits } from "../review/ai-notes";
 import { GITTENSORY_GATE_CHECK_NAME } from "../review/check-names";
+import { diffFilePriority } from "../review/review-diff";
 
 export type ParticipationLane = "direct_pr" | "issue_discovery" | "split" | "inactive" | "unknown";
 export type SignalFinding = AdvisoryFinding;
@@ -841,7 +842,6 @@ export function buildCollisionReport(
   const items = [...pairwiseIssues.map(issueItem), ...pairwisePullRequests.map(prItem), ...pairwiseRecentMergedPullRequests.map(recentMergedItem)];
   const itemTerms = new Map<string, CollisionTerms>();
   for (const item of items) itemTerms.set(itemKey(item), collisionTerms(item));
-  /* v8 ignore start -- Pairwise collision guards protect sparse cached rows; public collision behavior is covered by report tests. */
   for (let leftIndex = 0; leftIndex < items.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < items.length; rightIndex += 1) {
       const left = items[leftIndex];
@@ -862,6 +862,24 @@ export function buildCollisionReport(
       }
       const overlap = termOverlap(itemTerms.get(itemKey(left)) ?? collisionTerms(left), itemTerms.get(itemKey(right)) ?? collisionTerms(right));
       if (overlap.score < 0.58 || overlap.shared < 2) continue;
+      // Re-score without path terms: tells us whether title/label overlap ALONE already clears the bar
+      // (pre-existing behavior, unaffected) or whether changedFiles tokens are what pushed this pair over —
+      // the two false-positive shapes that creates are guarded separately below.
+      const titleOnlyOverlap = termOverlap(collisionTerms(left, false), collisionTerms(right, false));
+      const pathDrivenMatch = titleOnlyOverlap.score < 0.58 || titleOnlyOverlap.shared < 2;
+      if (pathDrivenMatch) {
+        // A contributor iterating on their own work (e.g. a follow-up PR touching the same file as their
+        // still-open prior PR) is not duplicate effort — self-authored path-only overlap is dropped outright.
+        if (isPullRequestShapedItem(left) && isPullRequestShapedItem(right) && Boolean(left.authorLogin) && sameLogin(left.authorLogin, right.authorLogin ?? "")) {
+          continue;
+        }
+        // Different authors: file paths tokenize into directory segments (src, review, test, unit, ...) that
+        // recur across nearly every PR in a consistently-organized repo, so shared TOKENS alone are not
+        // reliable collision evidence — a repo-wide shadow test found this drove the large majority of
+        // path-only matches with zero actual shared files. Require an ACTUAL shared file (ignoring
+        // lockfiles/generated artifacts nobody would call a collision over) before clustering.
+        if (!sharesMeaningfulFile(left.changedFiles, right.changedFiles)) continue;
+      }
       const key = [itemKey(left), itemKey(right)].sort().join("--");
       if (clusters.has(key)) continue;
       clusters.set(key, {
@@ -872,7 +890,6 @@ export function buildCollisionReport(
       });
     }
   }
-  /* v8 ignore stop */
 
   const clusterList = [...clusters.values()].sort((left, right) => riskRank(right.risk) - riskRank(left.risk));
   const report = {
@@ -5156,6 +5173,7 @@ function prItem(pr: PullRequestRecord): CollisionItem {
     labels: pr.labels,
     linkedIssues: pr.linkedIssues,
     linkedIssueClaimedAt: pr.linkedIssueClaimedAt,
+    changedFiles: pr.changedFiles,
     body: pr.body,
   };
 }
@@ -5217,8 +5235,8 @@ type CollisionTerms = {
 
 const collisionReportTermCache = new WeakMap<CollisionReport, Map<string, CollisionTerms>>();
 
-function collisionTerms(item: CollisionItem): CollisionTerms {
-  const terms = new Set(tokenize(collisionItemText(item)));
+function collisionTerms(item: CollisionItem, includePaths = true): CollisionTerms {
+  const terms = new Set(tokenize(collisionItemText(item, includePaths)));
   return { terms, size: terms.size };
 }
 
@@ -5251,11 +5269,11 @@ function termOverlap(left: CollisionTerms, right: CollisionTerms): { score: numb
   return { score: shared / Math.min(left.size, right.size), shared };
 }
 
-function collisionItemText(item: CollisionItem): string {
+function collisionItemText(item: CollisionItem, includePaths = true): string {
   return [
     truncateText(item.title, PREFLIGHT_LIMITS.titleChars),
     ...boundedTextItems(item.labels, PREFLIGHT_LIMITS.labels, PREFLIGHT_LIMITS.labelChars),
-    ...boundedTextItems(item.changedFiles, PREFLIGHT_LIMITS.changedFiles, PREFLIGHT_LIMITS.changedFileChars),
+    ...(includePaths ? boundedTextItems(item.changedFiles, PREFLIGHT_LIMITS.changedFiles, PREFLIGHT_LIMITS.changedFileChars) : []),
   ]
     .filter(Boolean)
     .join(" ");
@@ -5390,6 +5408,19 @@ function sameLogin(value: string | null | undefined, login: string): boolean {
   return value?.toLowerCase() === login.toLowerCase();
 }
 
+function isPullRequestShapedItem(item: CollisionItem): boolean {
+  return item.type === "pull_request" || item.type === "recent_merged_pull_request";
+}
+
+/** True when two changed-file lists share at least one path that isn't a lockfile/generated/vendor artifact
+ *  (diffFilePriority's least-useful-to-review bucket) — a shared package-lock.json or dist/ output is touched
+ *  incidentally by unrelated PRs and is not evidence of a real collision. */
+function sharesMeaningfulFile(left: string[] | undefined, right: string[] | undefined): boolean {
+  if (!left || !right || left.length === 0 || right.length === 0) return false;
+  const rightSet = new Set(right);
+  return left.some((path) => rightSet.has(path) && diffFilePriority(path) < 4);
+}
+
 function sameRepo(left: string | null | undefined, right: string | null | undefined): boolean {
   return Boolean(left && right && left.toLowerCase() === right.toLowerCase());
 }
@@ -5484,17 +5515,19 @@ function sanitizeOutcomeDimensionKey(key: string): string {
 }
 
 function isCodeFile(file: string): boolean {
-  return /\.(ts|tsx|js|jsx|py|rb|rs|kt|scala|java|go|sql)$/i.test(file) && !isTestFile(file);
+  // Mirrors isCodeFile in local-branch.ts — kept in sync (cs/swift/groovy/php added
+  // so C#/Swift/Groovy/PHP source counts as code, matching the test conventions
+  // isTestPath already recognizes).
+  return (
+    /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|rb|rs|kt|scala|java|go|sql|cs|swift|groovy|php)$/i.test(file) &&
+    !isTestFile(file)
+  );
 }
 
 function isTestFile(file: string): boolean {
-  return (
-    /(^|\/)(test|tests|spec|__tests__)\//i.test(file) ||
-    /(^|\/)src\/test\//i.test(file) ||
-    /(^|\/)[^/]+_test\.(go|py|rb)$/i.test(file) ||
-    /(^|\/)[^/]+_spec\.rb$/i.test(file) ||
-    /\.(test|spec)\.(ts|tsx|js|jsx|py|rb|rs)$/i.test(file)
-  );
+  // Single-sourced with the canonical matcher (test-evidence.ts isTestPath), mirroring local-branch.ts's
+  // isTestFile — so cy/e2e, __snapshots__, and module extensions stay in sync and can't drift.
+  return isTestPath(file);
 }
 
 function riskRank(risk: CollisionCluster["risk"]): number {

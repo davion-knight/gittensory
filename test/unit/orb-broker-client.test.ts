@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { drainOrbRelay, fetchBrokeredInstallationToken, isOrbBrokerMode, registerOrbRelayTarget } from "../../src/orb/broker-client";
+import {
+  createOrbRelayRegistrationState,
+  drainOrbRelay,
+  fetchBrokeredInstallationToken,
+  isOrbBrokerMode,
+  ORB_RELAY_REGISTER_RETRY_BACKOFF_MS,
+  registerOrbRelayTarget,
+  registerOrbRelayTargetWithRetry,
+} from "../../src/orb/broker-client";
 
 /** A fetch stub that records the URL + init and returns a fixed response. */
 function captureFetch(resp: Response): { fetchImpl: typeof fetch; calls: { url: string; init?: RequestInit | undefined }[] } {
@@ -20,12 +28,20 @@ describe("isOrbBrokerMode", () => {
 
 describe("fetchBrokeredInstallationToken", () => {
   it("exchanges the secret for a token + parses the expiry (default broker URL + Bearer secret)", async () => {
-    const { fetchImpl, calls } = captureFetch(Response.json({ token: "ghs_x", installationId: 42, expiresAt: "2026-06-25T09:00:00Z" }));
+    const { fetchImpl, calls } = captureFetch(Response.json({ token: "ghs_x", installationId: 42, expiresAt: "2026-06-25T09:00:00Z", permissions: { contents: "write" } }));
     const out = await fetchBrokeredInstallationToken({ ORB_ENROLLMENT_SECRET: "orbsec_x" }, fetchImpl);
-    expect(out).toEqual({ token: "ghs_x", installationId: 42, expiresAtMs: Date.parse("2026-06-25T09:00:00Z") });
+    expect(out).toEqual({ token: "ghs_x", installationId: 42, expiresAtMs: Date.parse("2026-06-25T09:00:00Z"), permissions: { contents: "write" } });
     expect(calls[0]?.url).toBe("https://gittensory-api.aethereal.dev/v1/orb/token");
     expect((calls[0]?.init?.headers as Record<string, string>).authorization).toBe("Bearer orbsec_x");
     expect(calls[0]?.init?.method).toBe("POST");
+    expect(calls[0]?.init?.body).toBeUndefined();
+  });
+
+  it("asks the broker to force-refresh when retrying a stale permission scope", async () => {
+    const { fetchImpl, calls } = captureFetch(Response.json({ token: "ghs_x", installationId: 42, expiresAt: "2026-06-25T09:00:00Z" }));
+    await fetchBrokeredInstallationToken({ ORB_ENROLLMENT_SECRET: "orbsec_x" }, fetchImpl, { forceRefresh: true });
+    expect((calls[0]?.init?.headers as Record<string, string>)["content-type"]).toBe("application/json");
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({ forceRefresh: true });
   });
 
   it("defaults installationId + expiry when absent, and strips a trailing slash from a custom broker URL", async () => {
@@ -33,6 +49,7 @@ describe("fetchBrokeredInstallationToken", () => {
     const out = await fetchBrokeredInstallationToken({ ORB_ENROLLMENT_SECRET: "s", ORB_BROKER_URL: "https://broker.example/" }, fetchImpl);
     expect(out.token).toBe("ghs_y");
     expect(out.installationId).toBe(0); // payload.installationId ?? 0
+    expect(out.permissions).toEqual({});
     expect(out.expiresAtMs).toBeGreaterThan(Date.now()); // payload.expiresAt absent → ~50min default
     expect(calls[0]?.url).toBe("https://broker.example/v1/orb/token");
   });
@@ -134,6 +151,93 @@ describe("registerOrbRelayTarget", () => {
     // No PUBLIC_API_ORIGIN — push would skip, but pull doesn't need an inbound URL.
     expect(await registerOrbRelayTarget({ ORB_ENROLLMENT_SECRET: "s", ORB_RELAY_MODE: "pull" }, fetchImpl)).toEqual({ status: "registered" });
     expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({ relayUrl: "", mode: "pull" });
+  });
+
+  it("surfaces a sanitized error/message hint from a JSON failure body without leaking raw bytes", async () => {
+    const cfg = { ORB_ENROLLMENT_SECRET: "s", PUBLIC_API_ORIGIN: "https://me.example" };
+    const errBody = (async () => Response.json({ error: "database unavailable" }, { status: 500 })) as typeof fetch;
+    expect(await registerOrbRelayTarget(cfg, errBody)).toEqual({ status: "failed", reason: "http_500: database unavailable" });
+
+    const messageBody = (async () => Response.json({ message: "install not found" }, { status: 404 })) as typeof fetch;
+    expect(await registerOrbRelayTarget(cfg, messageBody)).toEqual({ status: "failed", reason: "http_404: install not found" });
+  });
+
+  it("falls back to the bare status when the failure body is not JSON or has no error/message string", async () => {
+    const cfg = { ORB_ENROLLMENT_SECRET: "s", PUBLIC_API_ORIGIN: "https://me.example" };
+    expect(await registerOrbRelayTarget(cfg, (async () => new Response("", { status: 502 })) as typeof fetch)).toEqual({ status: "failed", reason: "http_502" });
+    expect(await registerOrbRelayTarget(cfg, (async () => new Response("<html>gateway error</html>", { status: 502 })) as typeof fetch)).toEqual({
+      status: "failed",
+      reason: "http_502",
+    });
+    expect(await registerOrbRelayTarget(cfg, (async () => Response.json({ code: "ETIMEDOUT" }, { status: 500 })) as typeof fetch)).toEqual({
+      status: "failed",
+      reason: "http_500",
+    });
+  });
+
+  it("truncates an overlong error hint instead of logging an unbounded body", async () => {
+    const cfg = { ORB_ENROLLMENT_SECRET: "s", PUBLIC_API_ORIGIN: "https://me.example" };
+    const longMessage = "x".repeat(500);
+    const result = await registerOrbRelayTarget(cfg, (async () => Response.json({ error: longMessage }, { status: 500 })) as typeof fetch);
+    expect(result.reason).toBe(`http_500: ${"x".repeat(200)}`);
+  });
+});
+
+describe("registerOrbRelayTargetWithRetry", () => {
+  it("skips outside broker mode without touching state", async () => {
+    const state = createOrbRelayRegistrationState();
+    expect(await registerOrbRelayTargetWithRetry({}, state)).toEqual({ status: "skipped" });
+    expect(state).toEqual({ registered: false, lastAttemptAtMs: null, attempts: 0 });
+  });
+
+  it("attempts, marks registered on success, and never attempts again", async () => {
+    const state = createOrbRelayRegistrationState();
+    const { fetchImpl, calls } = captureFetch(new Response("ok"));
+    const cfg = { ORB_ENROLLMENT_SECRET: "s", PUBLIC_API_ORIGIN: "https://me.example" };
+
+    const first = await registerOrbRelayTargetWithRetry(cfg, state, 1_000, fetchImpl);
+    expect(first).toEqual({ status: "registered" });
+    expect(state).toEqual({ registered: true, lastAttemptAtMs: 1_000, attempts: 1 });
+
+    const second = await registerOrbRelayTargetWithRetry(cfg, state, 2_000, fetchImpl);
+    expect(second).toEqual({ status: "already_registered" });
+    expect(calls).toHaveLength(1); // the second call never re-fetched
+  });
+
+  it("backs off after a failure and only retries once the backoff window elapses", async () => {
+    const state = createOrbRelayRegistrationState();
+    const cfg = { ORB_ENROLLMENT_SECRET: "s", PUBLIC_API_ORIGIN: "https://me.example" };
+    const failThenSucceed = (async () => new Response("no", { status: 500 })) as typeof fetch;
+
+    const first = await registerOrbRelayTargetWithRetry(cfg, state, 0, failThenSucceed);
+    expect(first).toEqual({ status: "failed", reason: "http_500" });
+    expect(state.attempts).toBe(1);
+
+    // Still inside the backoff window — must not re-attempt (no fetch call at all).
+    const stillBackingOff = await registerOrbRelayTargetWithRetry(
+      cfg,
+      state,
+      ORB_RELAY_REGISTER_RETRY_BACKOFF_MS - 1,
+      (async () => {
+        throw new Error("must not fetch during backoff");
+      }) as typeof fetch,
+    );
+    expect(stillBackingOff).toEqual({ status: "backoff" });
+    expect(state.attempts).toBe(1);
+
+    // Backoff elapsed — retries and can now recover.
+    const { fetchImpl: successFetch } = captureFetch(new Response("ok"));
+    const recovered = await registerOrbRelayTargetWithRetry(cfg, state, ORB_RELAY_REGISTER_RETRY_BACKOFF_MS, successFetch);
+    expect(recovered).toEqual({ status: "registered" });
+    expect(state).toEqual({ registered: true, lastAttemptAtMs: ORB_RELAY_REGISTER_RETRY_BACKOFF_MS, attempts: 2 });
+  });
+
+  it("passes through a skipped result from the underlying attempt (e.g. push mode with no public origin) without arming backoff", async () => {
+    const state = createOrbRelayRegistrationState();
+    const result = await registerOrbRelayTargetWithRetry({ ORB_ENROLLMENT_SECRET: "s" }, state, 500);
+    expect(result).toEqual({ status: "skipped" });
+    // skipped still counts as an attempt (it went through the backoff gate), but never registers.
+    expect(state.registered).toBe(false);
   });
 });
 

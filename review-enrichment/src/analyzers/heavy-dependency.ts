@@ -18,6 +18,42 @@ const MIN_INSTALL_BYTES = 500_000;
 const MIN_BUNDLE_BYTES = 80_000;
 const MIN_GZIP_BYTES = 25_000;
 
+// In-process TTL cache for bundlephobia size results. Keyed by "pkg@version".
+// Caching prevents redundant calls that would exhaust bundlephobia's rate limit
+// when multiple enrichment requests look up the same package spec.
+const WEIGHT_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+// Bounded so a long-lived process scanning many distinct pkg@version specs across PRs
+// can't grow this cache without limit (the key is attacker-influenced via manifest diffs).
+const MAX_WEIGHT_CACHE_ENTRIES = 1000;
+interface WeightCacheEntry {
+  value: PackageWeight | null;
+  expiresAt: number;
+}
+const weightCache = new Map<string, WeightCacheEntry>();
+
+export function resetWeightCacheForTest(): void {
+  weightCache.clear();
+}
+
+export function weightCacheSizeForTest(): number {
+  return weightCache.size;
+}
+
+function setWeightCache(cacheKey: string, entry: WeightCacheEntry): void {
+  if (weightCache.size >= MAX_WEIGHT_CACHE_ENTRIES && !weightCache.has(cacheKey)) {
+    const now = Date.now();
+    for (const [key, existing] of weightCache) {
+      if (existing.expiresAt <= now) weightCache.delete(key);
+    }
+    while (weightCache.size >= MAX_WEIGHT_CACHE_ENTRIES) {
+      const oldestKey = weightCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      weightCache.delete(oldestKey);
+    }
+  }
+  weightCache.set(cacheKey, entry);
+}
+
 const NPM_PACKAGE_RE =
   /^(?:@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*|[a-z0-9][a-z0-9._-]*)$/;
 const SEMVER_RE =
@@ -145,6 +181,13 @@ export async function queryPackageWeight(
   options: Pick<ScanOptions, "analysis" | "diagnostics"> = {},
 ): Promise<PackageWeight | null> {
   if (signal?.aborted) return null;
+
+  const cacheKey = `${pkg}@${version}`;
+  const cached = weightCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
   try {
     const packageSpec = encodeURIComponent(`${pkg}@${version}`);
     const url = `https://bundlephobia.com/api/size?package=${packageSpec}`;
@@ -171,14 +214,24 @@ export async function queryPackageWeight(
           gzip?: unknown;
           dependencyCount?: unknown;
         }>(url, fetchOptions);
-    if (!response.ok) return null;
+    if (!response.ok) {
+      // Only cache definitive HTTP responses (e.g. 404 not found, 429 rate-limited).
+      // Do not cache transient failures (timeout, network_error, aborted, circuit_open,
+      // call_cap) — those should be retried on the next enrichment request.
+      if (response.reason === "http_error") {
+        setWeightCache(cacheKey, { value: null, expiresAt: Date.now() + WEIGHT_CACHE_TTL_MS });
+      }
+      return null;
+    }
     const data = response.data;
-    return {
+    const result: PackageWeight = {
       installSizeBytes: numberOrNull(data.installSize),
       bundleSizeBytes: numberOrNull(data.size),
       gzipSizeBytes: numberOrNull(data.gzip),
       dependencyCount: numberOrNull(data.dependencyCount),
     };
+    setWeightCache(cacheKey, { value: result, expiresAt: Date.now() + WEIGHT_CACHE_TTL_MS });
+    return result;
   } catch {
     return null;
   }

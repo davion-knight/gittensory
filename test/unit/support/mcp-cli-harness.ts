@@ -234,6 +234,42 @@ export async function startFixtureServer(
       response.end(JSON.stringify(lintPrTextFixture(body)));
       return;
     }
+    if (request.url === "/v1/lint/slop-risk" && request.method === "POST") {
+      const body = (await readJsonRequest(request)) as {
+        changedFiles?: Array<{ path: string; additions?: number; deletions?: number }>;
+        description?: string;
+        tests?: string[];
+        testFiles?: string[];
+      };
+      response.end(JSON.stringify(slopRiskFixture(body)));
+      return;
+    }
+    if (request.url === "/v1/lint/issue-slop" && request.method === "POST") {
+      const body = (await readJsonRequest(request)) as { title?: string; body?: string };
+      response.end(JSON.stringify(issueSlopFixture(body)));
+      return;
+    }
+    if (request.url === "/v1/opportunities/find" && request.method === "POST") {
+      const body = (await readJsonRequest(request)) as {
+        targets?: Array<{ owner: string; repo: string }>;
+        searchQuery?: string;
+        goalSpec?: { lane?: string; minRankScore?: number; languages?: string[] };
+        limit?: number;
+      };
+      const limit = body.limit ?? 5;
+      const lane = body.goalSpec?.lane ?? "default";
+      const minRank = body.goalSpec?.minRankScore ?? 0;
+      const candidates = [
+        { owner: "JSONbored", repo: "gittensory", issueNumber: 100, title: "Improve REES test retry", rankScore: 85, laneFit: lane, freshness: 0.9, dupRisk: 0.1, aiPolicyAllowed: true },
+        { owner: "JSONbored", repo: "gittensory", issueNumber: 101, title: "Add label-audit coverage", rankScore: 72, laneFit: lane, freshness: 0.7, dupRisk: 0.2, aiPolicyAllowed: true },
+        { owner: "JSONbored", repo: "gittensory", issueNumber: 102, title: "Fix flaky buildBrief test", rankScore: 68, laneFit: lane, freshness: 0.5, dupRisk: 0.3, aiPolicyAllowed: true },
+        { owner: "JSONbored", repo: "gittensory", issueNumber: 103, title: "Normalize path matchers", rankScore: 55, laneFit: lane, freshness: 0.4, dupRisk: 0.1, aiPolicyAllowed: true },
+        { owner: "JSONbored", repo: "gittensory", issueNumber: 104, title: "Document score breakdown", rankScore: 45, laneFit: lane, freshness: 0.3, dupRisk: 0.1, aiPolicyAllowed: true },
+      ];
+      const ranked = candidates.filter((c) => c.rankScore >= minRank).slice(0, limit);
+      response.end(JSON.stringify({ ranked, totalCandidates: candidates.length, appliedLane: lane, appliedMinRankScore: minRank }));
+      return;
+    }
     // #784 maintainer controls (agent approval queue + kill-switch).
     if (request.url === "/v1/repos/owner/repo/agent/pending-actions" && request.method === "GET") {
       response.end(JSON.stringify({ repoFullName: "owner/repo", pendingActions: [{ id: "pa-1", actionClass: "merge", pullNumber: 7, reason: "clean", status: "pending" }] }));
@@ -436,5 +472,52 @@ export function lintPrTextFixture(input: { commitMessages?: string[]; prBody?: s
         evidence: missingTraceability ? "No linked issue or no-issue rationale." : `Linked issue #${input.linkedIssue}.`,
       },
     ],
+  };
+}
+
+export function slopRiskFixture(input: {
+  changedFiles?: Array<{ path: string; additions?: number; deletions?: number }>;
+  description?: string;
+  tests?: string[];
+  testFiles?: string[];
+} = {}) {
+  const changedFiles = input.changedFiles ?? [];
+  const hasCodeChange = changedFiles.some((file) => !file.path.includes(".test."));
+  const hasTestEvidence = changedFiles.some((file) => file.path.includes(".test.")) || (input.testFiles?.length ?? 0) > 0 || (input.tests?.length ?? 0) > 0;
+  const emptyDescription = !input.description?.trim();
+  const elevated = hasCodeChange && (!hasTestEvidence || emptyDescription);
+  const slopRisk = elevated ? 45 : 0;
+  const findings =
+    elevated && emptyDescription
+      ? [{ code: "empty_description", title: "Empty PR description", severity: "warning", detail: "Add a specific summary of what changed and why." }]
+      : elevated
+        ? [{ code: "missing_test_evidence", title: "Missing test evidence", severity: "warning", detail: "Add or update tests for the changed behavior." }]
+        : [];
+  return {
+    slopRisk,
+    band: slopRisk <= 0 ? "clean" : slopRisk < 25 ? "low" : slopRisk < 60 ? "elevated" : "high",
+    findings,
+    rubric: "Fixture slop rubric.",
+  };
+}
+
+export function issueSlopFixture(input: { title?: string; body?: string } = {}) {
+  const bodyText = typeof input.body === "string" ? input.body : "";
+  const emptyBody = !bodyText.trim();
+  const unfilledTemplate = !emptyBody && /##\s*summary/i.test(bodyText) && /-\s*\[?\s*\]?\s*$/m.test(bodyText);
+  const titleOnly = !emptyBody && !unfilledTemplate && input.title && bodyText.trim().toLowerCase() === input.title.trim().toLowerCase();
+  const slopRisk = emptyBody ? 30 : unfilledTemplate ? 40 : titleOnly ? 25 : 0;
+  const findings = emptyBody
+    ? [{ code: "empty_issue_body", title: "Issue has no description", severity: "warning", detail: "This issue was opened with an empty body." }]
+    : unfilledTemplate
+      ? [{ code: "unfilled_issue_template", title: "Issue template left unfilled", severity: "warning", detail: "Fill in the issue template sections with concrete detail." }]
+      : titleOnly
+        ? [{ code: "title_restatement", title: "Issue body only restates the title", severity: "warning", detail: "Add specific detail beyond the title." }]
+        : [];
+  return {
+    slopRisk,
+    band: slopRisk <= 0 ? "clean" : slopRisk < 25 ? "low" : slopRisk < 60 ? "elevated" : "high",
+    findings,
+    rubric: "Fixture issue slop rubric.",
   };
 }

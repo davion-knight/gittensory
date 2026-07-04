@@ -1,9 +1,12 @@
 import { parse as parseYaml } from "yaml";
-import type { GatePolicyPack, GateRuleMode, JsonValue, RepositorySettings } from "../types";
+import type { GatePolicyPack, GateRuleMode, JsonValue, LinkedIssueLabelPropagationConfig, PrTypeLabelSet, RepositorySettings } from "../types";
 import { normalizeAutonomyPolicy, normalizeAutoMaintainPolicy } from "../settings/autonomy";
 import { normalizeCommandAuthorizationPolicy } from "../settings/command-authorization";
 import { mergeContributorBlacklists, normalizeContributorBlacklist } from "../settings/contributor-blacklist";
 import { normalizeAutoCloseExemptLogins } from "../settings/auto-close-exempt";
+import { DEFAULT_TYPE_LABELS, normalizeTypeLabelSet } from "../settings/pr-type-label";
+import { DEFAULT_LINKED_ISSUE_LABEL_PROPAGATION, normalizeLinkedIssueLabelPropagationConfig, VALID_LINKED_ISSUE_LABEL_PROPAGATION_MODES } from "../review/linked-issue-label-propagation";
+import { normalizeModerationLabel, normalizeModerationRules } from "../settings/moderation-rules";
 import { hasUnsafeWildcardCount } from "./change-guardrail";
 import { PUBLIC_LOCAL_PATH_INLINE } from "./redaction";
 
@@ -32,6 +35,11 @@ export type FocusManifestGateConfig = {
   slopMinScore: number | null;
   slopAiAdvisory: boolean | null;
   sizeMode: GateRuleMode | null;
+  /** `gate.lockfileIntegrity` (#2563): off|advisory|block, off by default. When not off, a changed
+   *  `package-lock.json` diff is scanned for a `resolved`/`integrity` change unaccompanied by a matching
+   *  `package.json` version bump, or a `resolved` URL outside `registry.npmjs.org` — a `lockfile_tamper_risk`
+   *  finding (`block` additionally hard-blocks). Config-as-code only — no DB column or dashboard toggle. */
+  lockfileIntegrityMode: GateRuleMode | null;
   aiReviewMode: GateRuleMode | null;
   aiReviewByok: boolean | null;
   aiReviewProvider: "anthropic" | "openai" | null;
@@ -40,6 +48,23 @@ export type FocusManifestGateConfig = {
   /** `gate.aiReview.closeConfidence` (#7): minimum calibrated AI-reviewer confidence (0-1) for an AI defect to BLOCK
    *  under `aiReview.mode: block`. null (unset) ⇒ the gate's 0.93 default. Clamped to [0,1] at parse time. */
   aiReviewCloseConfidence: number | null;
+  /** `gate.aiReview.combine` (#2567): per-repo override of the self-host operator's `AI_REVIEW_PLAN.combine`
+   *  boot default (single/consensus/synthesis). null (unset) ⇒ the operator's plan (or `consensus`). A
+   *  REFINEMENT only — see {@link aiReviewOnMerge} for the operator-floor clamp `runGittensoryAiReview` applies
+   *  to the paired `onMerge` field; `combine` itself is not floor-clamped (the three strategies are not ordered
+   *  by strictness, so there is no single "loosening" direction to clamp). */
+  aiReviewCombine: import("../types").CombineStrategy | null;
+  /** `gate.aiReview.onMerge` (#2567): per-repo override of the `synthesis` merge rule. `either` is the STRICTER
+   *  rule (any one reviewer's blocker blocks/holds); `both` is more PERMISSIVE (requires every reviewer to
+   *  agree). null (unset) ⇒ the operator's `AI_REVIEW_PLAN.onMerge`. A repo may only TIGHTEN the operator's
+   *  floor (never loosen `either` down to `both`) — `runGittensoryAiReview` enforces the clamp at resolve time,
+   *  since only it can see both the per-repo value and the operator's plan. */
+  aiReviewOnMerge: import("../types").OnMerge | null;
+  /** `gate.aiReview.reviewers` (#2567): per-repo override of the named reviewer pair(s) to run, in place of the
+   *  operator's `AI_REVIEW_PLAN.reviewers` (or the free Workers-AI pair when the operator configured none). null
+   *  (unset) ⇒ the operator's plan. No operator floor applies to WHICH reviewers run (only `onMerge` gates
+   *  strictness), so this always wins unclamped when set. */
+  aiReviewReviewers: ReadonlyArray<{ model: string; fallback?: string | null | undefined }> | null;
   mergeReadiness: GateRuleMode | null;
   manifestPolicy: GateRuleMode | null;
   selfAuthoredLinkedIssue: GateRuleMode | null;
@@ -60,6 +85,23 @@ export type FocusManifestGateConfig = {
    *  (byte-identical to today) — a discrete positive-minutes count, not a score, so it is neither clamped
    *  nor rounded; an invalid value (fractional, non-positive, non-finite) is dropped with a warning. */
   requireFreshRebaseWindowMinutes: number | null;
+  /** `gate.claMode` (#2564): off/advisory/block. null (unset) ⇒ off (byte-identical to today) — a repo must
+   *  explicitly opt in before any CLA consent check runs. */
+  claMode: GateRuleMode | null;
+  /** `gate.cla.consentPhrase` (#2564): the required PR-body consent phrase. null (unset) ⇒ phrase-match
+   *  detection is not configured. */
+  claConsentPhrase: string | null;
+  /** `gate.cla.checkRunName` (#2564): the CLA-bot check-run name to trust. null (unset) ⇒ check-run
+   *  detection is not configured. */
+  claCheckRunName: string | null;
+  /** `gate.cla.checkRunAppSlug`: the trusted GitHub App slug that must produce `checkRunName`. null (unset) ⇒
+   *  check-run detection remains unresolved rather than trusting a spoofable name-only match. */
+  claCheckRunAppSlug: string | null;
+  /** `gate.expectedCiContexts` (#selfhost-ci-verification): CI check/status context names to treat as
+   *  required when GitHub branch-protection required-status-checks are unreadable or unconfigured. null
+   *  (unset) ⇒ no generic fallback configured — the live-CI aggregate keeps today's fold-all behavior
+   *  when branch protection is also unreadable. See {@link RepositorySettings.expectedCiContexts}. */
+  expectedCiContexts: ReadonlyArray<string> | null;
 };
 
 // The converged per-PR review features a self-host operator toggles PER-REPO under `features:` in the private
@@ -127,6 +169,7 @@ export type FocusManifestSettings = Partial<
     | "aiReviewAllAuthors"
     | "closeOwnerAuthors"
     | "autoLabelEnabled"
+    | "typeLabelsEnabled"
     | "badgeEnabled"
     | "gittensorLabel"
     | "createMissingLabel"
@@ -145,15 +188,35 @@ export type FocusManifestSettings = Partial<
     | "contributorOpenPrCap"
     | "contributorOpenIssueCap"
     | "contributorCapLabel"
+    | "contributorCapCancelCi"
     | "reviewNagPolicy"
     | "reviewNagMaxPings"
     | "reviewNagCooldownDays"
     | "reviewNagLabel"
+    | "reviewNagMonitoredMentions"
     | "autoCloseExemptLogins"
     | "accountAgeThresholdDays"
     | "newAccountLabel"
+    | "commandRateLimitPolicy"
+    | "commandRateLimitMaxPerWindow"
+    | "commandRateLimitAiMaxPerWindow"
+    | "commandRateLimitWindowHours"
+    | "moderationGateMode"
+    | "moderationRules"
+    | "moderationWarningLabel"
+    | "moderationBannedLabel"
   >
->;
+> & {
+  // `typeLabels`/`linkedIssueLabelPropagation` are declared PARTIAL here (not via the `Pick<RepositorySettings,
+  // ...>` above, which would force a complete, defaults-filled object) so `resolveEffectiveSettings` can merge
+  // them field-by-field against the DB value — a `.gittensory.yml` override naming only one key (e.g. just
+  // `typeLabels.priority`) must inherit the OTHER keys from the DB-persisted value, not silently reset them to
+  // the built-in default (#priority-linked-issue-gate). `mappings` is still a complete replacement when
+  // present (arrays don't have per-item precedence semantics, matching the private-config layer's own
+  // documented array-replace-wholesale overlay behavior).
+  typeLabels?: Partial<PrTypeLabelSet> | undefined;
+  linkedIssueLabelPropagation?: Partial<LinkedIssueLabelPropagationConfig> | undefined;
+};
 
 /** Field keys for the public review-panel rows a maintainer can show/hide via `review.fields`. */
 export const REVIEW_FIELD_KEYS = ["linkedIssue", "relatedWork", "reviewLoad", "validationEvidence", "openPrQueue", "contributorContext", "gateResult"] as const;
@@ -180,6 +243,11 @@ export type FocusManifestReviewConfig = {
   fields: Partial<Record<ReviewFieldKey, boolean>>;
   /** `review.profile`: chill / balanced / assertive. null (absent) = balanced = byte-identical reviewer prompt. */
   profile: ReviewProfile | null;
+  /** `review.security_focus`: when true, the AI reviewer is told to prioritize a security-defect category
+   *  (injection, authn/authz bypass, secret handling, unsafe deserialization, SSRF, path traversal) with
+   *  elevated scrutiny, ON TOP OF whatever `profile` volume is set — an orthogonal "what to prioritize" axis,
+   *  not a fourth profile level. null/false (default, absent) = byte-identical reviewer prompt. (#review-security-focus) */
+  securityFocus: boolean | null;
   /** `review.inline_comments`: when true, the AI reviewer ALSO leaves quiet, non-blocking inline PR comments on
    *  specific changed lines (in addition to the decision summary). null/false (default, absent) = no inline
    *  comments = byte-identical behavior. Operator-gated too (GITTENSORY_REVIEW_INLINE_COMMENTS + allowlist).
@@ -299,12 +367,16 @@ const EMPTY_GATE_CONFIG: FocusManifestGateConfig = {
   slopMinScore: null,
   slopAiAdvisory: null,
   sizeMode: null,
+  lockfileIntegrityMode: null,
   aiReviewMode: null,
   aiReviewByok: null,
   aiReviewProvider: null,
   aiReviewModel: null,
   aiReviewAllAuthors: null,
   aiReviewCloseConfidence: null,
+  aiReviewCombine: null,
+  aiReviewOnMerge: null,
+  aiReviewReviewers: null,
   mergeReadiness: null,
   manifestPolicy: null,
   selfAuthoredLinkedIssue: null,
@@ -312,6 +384,11 @@ const EMPTY_GATE_CONFIG: FocusManifestGateConfig = {
   firstTimeContributorGrace: null,
   premergeContentRecheck: null,
   requireFreshRebaseWindowMinutes: null,
+  claMode: null,
+  claConsentPhrase: null,
+  claCheckRunName: null,
+  claCheckRunAppSlug: null,
+  expectedCiContexts: null,
 };
 
 const EMPTY_FEATURES_CONFIG: FocusManifestFeaturesConfig = {
@@ -346,7 +423,7 @@ const EMPTY_MANIFEST: FocusManifest = {
   publicNotes: [],
   gate: { ...EMPTY_GATE_CONFIG },
   settings: {},
-  review: { present: false, footerText: null, note: null, fields: {}, profile: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] },
+  review: { present: false, footerText: null, note: null, fields: {}, profile: null, securityFocus: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] },
   features: { ...EMPTY_FEATURES_CONFIG },
   contentLane: { ...EMPTY_CONTENT_LANE_CONFIG },
   warnings: [],
@@ -375,7 +452,7 @@ function emptyManifest(source: FocusManifestSource, warnings: string[] = []): Fo
     warnings,
     gate: { ...EMPTY_GATE_CONFIG },
     settings: {},
-    review: { present: false, footerText: null, note: null, fields: {}, profile: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] },
+    review: { present: false, footerText: null, note: null, fields: {}, profile: null, securityFocus: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] },
     features: { ...EMPTY_FEATURES_CONFIG },
     contentLane: { ...EMPTY_CONTENT_LANE_CONFIG },
   };
@@ -410,6 +487,15 @@ function normalizeStringList(value: JsonValue | undefined, field: string, warnin
     }
   }
   return result;
+}
+
+/** Like {@link normalizeStringList}, but returns `null` (not `[]`) when unset or when nothing survives
+ *  validation — the convention every OTHER `FocusManifestGateConfig` field uses for "not configured", so
+ *  the resolver's `!== null` overlay checks work uniformly. */
+function normalizeOptionalStringList(value: JsonValue | undefined, field: string, warnings: string[]): ReadonlyArray<string> | null {
+  if (value === undefined || value === null) return null;
+  const list = normalizeStringList(value, field, warnings);
+  return list.length > 0 ? list : null;
 }
 
 function normalizeEnum<T extends string>(value: JsonValue | undefined, field: string, allowed: readonly T[], fallback: T, warnings: string[]): T {
@@ -479,6 +565,49 @@ function normalizeOptionalConfidence(value: JsonValue | undefined, field: string
   return Math.max(0, Math.min(1, value));
 }
 
+// A hard cap on `gate.aiReview.reviewers` entries — the combiner only ever addresses reviewer[0]/[1] (single runs
+// one, consensus/synthesis run two), so anything beyond 2 is inert; capping at 4 leaves headroom without letting a
+// hostile/huge manifest bloat the parsed config for no functional gain.
+const MAX_AI_REVIEW_REVIEWERS = 4;
+
+/** Normalize `gate.aiReview.reviewers` (#2567) — a list of `{ model, fallback? }` entries naming self-host
+ *  providers (e.g. `claude-code`, `codex`) to run in place of the operator's `AI_REVIEW_PLAN.reviewers`. Each
+ *  entry needs a non-empty string `model`; `fallback` is optional and, when present, must also be a non-empty
+ *  string. Invalid entries are dropped with a warning rather than failing the whole list, mirroring the other
+ *  manifest list parsers. Absent/empty/all-invalid ⇒ null (so the resolver's `??` fallback to the operator's
+ *  plan is untouched). */
+function normalizeOptionalReviewers(
+  value: JsonValue | undefined,
+  field: string,
+  warnings: string[],
+): ReadonlyArray<{ model: string; fallback?: string | null | undefined }> | null {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) {
+    warnings.push(`Manifest gate field "${field}" must be a list of { model, fallback? }; ignoring it.`);
+    return null;
+  }
+  const out: Array<{ model: string; fallback?: string | null | undefined }> = [];
+  for (const [index, entry] of value.entries()) {
+    if (out.length >= MAX_AI_REVIEW_REVIEWERS) {
+      warnings.push(`Manifest gate field "${field}" is capped at ${MAX_AI_REVIEW_REVIEWERS} entries; dropping the rest.`);
+      break;
+    }
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      warnings.push(`Manifest gate field "${field}[${index}]" must be a mapping with a "model" string; ignoring it.`);
+      continue;
+    }
+    const e = entry as Record<string, JsonValue>;
+    const model = typeof e.model === "string" ? e.model.trim() : "";
+    if (!model) {
+      warnings.push(`Manifest gate field "${field}[${index}].model" must be a non-empty string; ignoring the entry.`);
+      continue;
+    }
+    const fallback = typeof e.fallback === "string" && e.fallback.trim() ? e.fallback.trim() : undefined;
+    out.push(fallback ? { model, fallback } : { model });
+  }
+  return out.length > 0 ? out : null;
+}
+
 /**
  * Parse the optional `gate:` mapping. Every field stays `null` when unset so the resolver can layer
  * this OVER DB settings without clobbering. A nested `readiness: { mode, minScore }` block is accepted.
@@ -510,6 +639,11 @@ function parseGateConfig(value: JsonValue | undefined, warnings: string[]): Focu
   if (size !== undefined && size !== null && sizeRecord === undefined) {
     warnings.push(`Manifest gate field "gate.size" must be a mapping; ignoring it.`);
   }
+  const cla = record.cla;
+  const claRecord = cla !== null && typeof cla === "object" && !Array.isArray(cla) ? (cla as Record<string, JsonValue>) : undefined;
+  if (cla !== undefined && cla !== null && claRecord === undefined) {
+    warnings.push(`Manifest gate field "gate.cla" must be a mapping; ignoring it.`);
+  }
   const gate: FocusManifestGateConfig = {
     present: false,
     enabled: normalizeOptionalBoolean(record.enabled, "gate.enabled", warnings),
@@ -522,12 +656,16 @@ function parseGateConfig(value: JsonValue | undefined, warnings: string[]): Focu
     slopMinScore: normalizeOptionalScore(slopRecord?.minScore, "gate.slop.minScore", warnings),
     slopAiAdvisory: normalizeOptionalBoolean(slopRecord?.aiAdvisory, "gate.slop.aiAdvisory", warnings),
     sizeMode: normalizeOptionalGateMode(sizeRecord?.mode, "gate.size.mode", warnings),
+    lockfileIntegrityMode: normalizeOptionalGateMode(record.lockfileIntegrity, "gate.lockfileIntegrity", warnings),
     aiReviewMode: normalizeOptionalGateMode(aiReviewRecord?.mode, "gate.aiReview.mode", warnings),
     aiReviewByok: normalizeOptionalBoolean(aiReviewRecord?.byok, "gate.aiReview.byok", warnings),
     aiReviewProvider: normalizeOptionalEnum(aiReviewRecord?.provider, "gate.aiReview.provider", ["anthropic", "openai"] as const, warnings),
     aiReviewModel: normalizeOptionalString(aiReviewRecord?.model, "gate.aiReview.model", warnings),
     aiReviewAllAuthors: normalizeOptionalBoolean(aiReviewRecord?.allAuthors, "gate.aiReview.allAuthors", warnings),
     aiReviewCloseConfidence: normalizeOptionalConfidence(aiReviewRecord?.closeConfidence, "gate.aiReview.closeConfidence", warnings),
+    aiReviewCombine: normalizeOptionalEnum(aiReviewRecord?.combine, "gate.aiReview.combine", ["single", "consensus", "synthesis"] as const, warnings),
+    aiReviewOnMerge: normalizeOptionalEnum(aiReviewRecord?.onMerge, "gate.aiReview.onMerge", ["either", "both"] as const, warnings),
+    aiReviewReviewers: normalizeOptionalReviewers(aiReviewRecord?.reviewers, "gate.aiReview.reviewers", warnings),
     mergeReadiness: normalizeOptionalGateMode(record.mergeReadiness, "gate.mergeReadiness", warnings),
     manifestPolicy: normalizeOptionalGateMode(record.manifestPolicy, "gate.manifestPolicy", warnings),
     selfAuthoredLinkedIssue: normalizeOptionalGateMode(record.selfAuthoredLinkedIssue, "gate.selfAuthoredLinkedIssue", warnings),
@@ -535,6 +673,11 @@ function parseGateConfig(value: JsonValue | undefined, warnings: string[]): Focu
     firstTimeContributorGrace: normalizeOptionalBoolean(record.firstTimeContributorGrace, "gate.firstTimeContributorGrace", warnings),
     premergeContentRecheck: normalizeOptionalBoolean(record.premergeContentRecheck, "gate.premergeContentRecheck", warnings),
     requireFreshRebaseWindowMinutes: normalizeOptionalPositiveInteger(record.requireFreshRebaseWindow, "gate.requireFreshRebaseWindow", warnings),
+    claMode: normalizeOptionalGateMode(record.claMode, "gate.claMode", warnings),
+    claConsentPhrase: parsePublicSafeText(claRecord?.consentPhrase, "gate.cla.consentPhrase", warnings),
+    claCheckRunName: parsePublicSafeText(claRecord?.checkRunName, "gate.cla.checkRunName", warnings),
+    claCheckRunAppSlug: parsePublicSafeText(claRecord?.checkRunAppSlug, "gate.cla.checkRunAppSlug", warnings),
+    expectedCiContexts: normalizeOptionalStringList(record.expectedCiContexts, "gate.expectedCiContexts", warnings),
   };
   // #2266: the flag is parsed, clamped, and threaded end-to-end, but the gate evaluator never reads it — a
   // maintainer who sets it to true believing it softens a blocker for newcomers gets no such effect. Surface
@@ -554,19 +697,28 @@ function parseGateConfig(value: JsonValue | undefined, warnings: string[]): Focu
     gate.slopMinScore !== null ||
     gate.slopAiAdvisory !== null ||
     gate.sizeMode !== null ||
+    gate.lockfileIntegrityMode !== null ||
     gate.aiReviewMode !== null ||
     gate.aiReviewByok !== null ||
     gate.aiReviewProvider !== null ||
     gate.aiReviewModel !== null ||
     gate.aiReviewAllAuthors !== null ||
     gate.aiReviewCloseConfidence !== null ||
+    gate.aiReviewCombine !== null ||
+    gate.aiReviewOnMerge !== null ||
+    gate.aiReviewReviewers !== null ||
     gate.mergeReadiness !== null ||
     gate.manifestPolicy !== null ||
     gate.selfAuthoredLinkedIssue !== null ||
     gate.dryRun !== null ||
     gate.firstTimeContributorGrace !== null ||
     gate.premergeContentRecheck !== null ||
-    gate.requireFreshRebaseWindowMinutes !== null;
+    gate.requireFreshRebaseWindowMinutes !== null ||
+    gate.claMode !== null ||
+    gate.claConsentPhrase !== null ||
+    gate.claCheckRunName !== null ||
+    gate.claCheckRunAppSlug !== null ||
+    gate.expectedCiContexts !== null;
   return gate;
 }
 
@@ -588,6 +740,7 @@ export function gateConfigToJson(gate: FocusManifestGateConfig): JsonValue {
     out.readiness = readiness;
   }
   if (gate.sizeMode !== null) out.size = { mode: gate.sizeMode };
+  if (gate.lockfileIntegrityMode !== null) out.lockfileIntegrity = gate.lockfileIntegrityMode;
   if (gate.slopMode !== null || gate.slopMinScore !== null || gate.slopAiAdvisory !== null) {
     const slop: Record<string, JsonValue> = {};
     if (gate.slopMode !== null) slop.mode = gate.slopMode;
@@ -595,7 +748,17 @@ export function gateConfigToJson(gate: FocusManifestGateConfig): JsonValue {
     if (gate.slopAiAdvisory !== null) slop.aiAdvisory = gate.slopAiAdvisory;
     out.slop = slop;
   }
-  if (gate.aiReviewMode !== null || gate.aiReviewByok !== null || gate.aiReviewProvider !== null || gate.aiReviewModel !== null || gate.aiReviewAllAuthors !== null || gate.aiReviewCloseConfidence !== null) {
+  if (
+    gate.aiReviewMode !== null ||
+    gate.aiReviewByok !== null ||
+    gate.aiReviewProvider !== null ||
+    gate.aiReviewModel !== null ||
+    gate.aiReviewAllAuthors !== null ||
+    gate.aiReviewCloseConfidence !== null ||
+    gate.aiReviewCombine !== null ||
+    gate.aiReviewOnMerge !== null ||
+    gate.aiReviewReviewers !== null
+  ) {
     const aiReview: Record<string, JsonValue> = {};
     if (gate.aiReviewMode !== null) aiReview.mode = gate.aiReviewMode;
     if (gate.aiReviewByok !== null) aiReview.byok = gate.aiReviewByok;
@@ -603,6 +766,13 @@ export function gateConfigToJson(gate: FocusManifestGateConfig): JsonValue {
     if (gate.aiReviewModel !== null) aiReview.model = gate.aiReviewModel;
     if (gate.aiReviewAllAuthors !== null) aiReview.allAuthors = gate.aiReviewAllAuthors;
     if (gate.aiReviewCloseConfidence !== null) aiReview.closeConfidence = gate.aiReviewCloseConfidence;
+    if (gate.aiReviewCombine !== null) aiReview.combine = gate.aiReviewCombine;
+    if (gate.aiReviewOnMerge !== null) aiReview.onMerge = gate.aiReviewOnMerge;
+    if (gate.aiReviewReviewers !== null) {
+      aiReview.reviewers = gate.aiReviewReviewers.map((r) =>
+        r.fallback ? { model: r.model, fallback: r.fallback } : { model: r.model },
+      ) as JsonValue;
+    }
     out.aiReview = aiReview;
   }
   if (gate.mergeReadiness !== null) out.mergeReadiness = gate.mergeReadiness;
@@ -612,6 +782,15 @@ export function gateConfigToJson(gate: FocusManifestGateConfig): JsonValue {
   if (gate.firstTimeContributorGrace !== null) out.firstTimeContributorGrace = gate.firstTimeContributorGrace;
   if (gate.premergeContentRecheck !== null) out.premergeContentRecheck = gate.premergeContentRecheck;
   if (gate.requireFreshRebaseWindowMinutes !== null) out.requireFreshRebaseWindow = gate.requireFreshRebaseWindowMinutes;
+  if (gate.claMode !== null) out.claMode = gate.claMode;
+  if (gate.claConsentPhrase !== null || gate.claCheckRunName !== null || gate.claCheckRunAppSlug !== null) {
+    const cla: Record<string, JsonValue> = {};
+    if (gate.claConsentPhrase !== null) cla.consentPhrase = gate.claConsentPhrase;
+    if (gate.claCheckRunName !== null) cla.checkRunName = gate.claCheckRunName;
+    if (gate.claCheckRunAppSlug !== null) cla.checkRunAppSlug = gate.claCheckRunAppSlug;
+    out.cla = cla;
+  }
+  if (gate.expectedCiContexts !== null) out.expectedCiContexts = gate.expectedCiContexts as JsonValue;
   return out;
 }
 
@@ -741,6 +920,13 @@ function normalizeOptionalString(value: JsonValue | undefined, field: string, wa
   return null;
 }
 
+// Keep the review-nag lookback operationally bounded so repo-controlled config cannot overflow Date
+// arithmetic. Duplicated from settings/agent-actions.ts's own MAX_REVIEW_NAG_COOLDOWN_DAYS (same value,
+// same rationale) rather than imported: this module is part of the UI package's typechecked closure, and
+// agent-actions.ts transitively imports github/commands.ts -> utils/crypto.ts, pulling a heavier
+// GitHub-App-specific dependency chain into the UI build for one small constant.
+const MAX_REVIEW_NAG_COOLDOWN_DAYS = 365;
+
 /**
  * Parse the optional `settings:` mapping — a partial repository-settings override. Only recognized
  * fields are kept; unknown/invalid values are dropped with a warning and never throw.
@@ -786,11 +972,18 @@ function parseSettingsOverride(value: JsonValue | undefined, warnings: string[])
   if (aiReviewModel !== null) out.aiReviewModel = aiReviewModel;
   const gittensorLabel = normalizeOptionalString(r.gittensorLabel, "settings.gittensorLabel", warnings);
   if (gittensorLabel !== null) out.gittensorLabel = gittensorLabel;
-  const blacklistLabel = normalizeOptionalString(r.blacklistLabel, "settings.blacklistLabel", warnings);
-  if (blacklistLabel !== null) out.blacklistLabel = blacklistLabel;
+  // #label-scoping: an explicit yml `null` is load-bearing (closes WITHOUT any label), matching
+  // contributorOpenPrCap's own null-vs-omitted distinction — must be checked BEFORE normalizeOptionalString,
+  // which otherwise collapses null and undefined to the same "unset" result.
+  if (r.blacklistLabel === null) {
+    out.blacklistLabel = null;
+  } else {
+    const blacklistLabel = normalizeOptionalString(r.blacklistLabel, "settings.blacklistLabel", warnings);
+    if (blacklistLabel !== null) out.blacklistLabel = blacklistLabel;
+  }
   const publicSurface = normalizeOptionalEnum(r.publicSurface, "settings.publicSurface", ["off", "comment_and_label", "comment_only", "label_only"] as const, warnings);
   if (publicSurface !== null) out.publicSurface = publicSurface;
-  for (const key of ["aiReviewByok", "aiReviewAllAuthors", "closeOwnerAuthors", "autoLabelEnabled", "badgeEnabled", "createMissingLabel", "includeMaintainerAuthors", "requireLinkedIssue", "backfillEnabled", "privateTrustEnabled", "agentPaused", "agentDryRun"] as const) {
+  for (const key of ["aiReviewByok", "aiReviewAllAuthors", "closeOwnerAuthors", "autoLabelEnabled", "typeLabelsEnabled", "badgeEnabled", "createMissingLabel", "includeMaintainerAuthors", "requireLinkedIssue", "backfillEnabled", "privateTrustEnabled", "agentPaused", "agentDryRun"] as const) {
     const flag = normalizeOptionalBoolean(r[key], `settings.${key}`, warnings);
     if (flag !== null) out[key] = flag;
   }
@@ -822,6 +1015,54 @@ function parseSettingsOverride(value: JsonValue | undefined, warnings: string[])
   } else if (r.commandAuthorization !== undefined) {
     warnings.push(`Manifest "settings.commandAuthorization" must be an object; ignoring it and keeping any existing policy.`);
   }
+  // TYPE label NAME overrides (#priority-linked-issue-gate): unlike commandAuthorization/autoMaintain
+  // above, this is deliberately kept SPARSE -- only the keys actually present AND validly-shaped in the
+  // raw YAML are copied onto `out.typeLabels` (via `normalizeTypeLabelSet`, which still fills in the
+  // OTHER keys to run its own shape checks, but those defaults-filled values are discarded here). A
+  // manifest naming only `typeLabels.priority` must inherit `bug`/`feature` from the DB-persisted value in
+  // `resolveEffectiveSettings`, not have them silently reset to the built-in gittensor:* names -- assigning
+  // the normalizer's complete object here would do exactly that via the resolver's wholesale
+  // `{...dbSettings, ...manifest.settings}` spread. The per-field shape check below (not just "is the key
+  // present") matters too: a malformed value (e.g. `typeLabels.priority: 123`) is present but invalid, so
+  // `normalizeTypeLabelSet` warns and reports its OWN built-in-default fallback for that key -- copying
+  // that fallback into the sparse override would silently overwrite a DB-customized value with the
+  // built-in default on a config typo, instead of leaving the DB value alone.
+  if (typeof r.typeLabels === "object" && r.typeLabels !== null && !Array.isArray(r.typeLabels)) {
+    const rawTypeLabels = r.typeLabels as Record<string, unknown>;
+    const validated = normalizeTypeLabelSet(rawTypeLabels, warnings);
+    const isValidLabelName = (value: unknown): boolean => typeof value === "string" && value.trim().length > 0;
+    const sparseTypeLabels: Partial<PrTypeLabelSet> = {};
+    if (isValidLabelName(rawTypeLabels.bug)) sparseTypeLabels.bug = validated.bug;
+    if (isValidLabelName(rawTypeLabels.feature)) sparseTypeLabels.feature = validated.feature;
+    if (isValidLabelName(rawTypeLabels.priority)) sparseTypeLabels.priority = validated.priority;
+    out.typeLabels = sparseTypeLabels;
+  } else if (r.typeLabels !== undefined) {
+    warnings.push(`Manifest "settings.typeLabels" must be an object; ignoring it and keeping any existing label names.`);
+  }
+  // Linked-issue label propagation (#priority-linked-issue-gate): same sparse-partial shape as typeLabels
+  // above, for the same reason -- this is the ONLY mechanism that can ever select a maintainer-reward
+  // label like gittensor:priority (never inferred from title/files/AI/PR-labels), so a manifest overriding
+  // just one field (e.g. `enabled`) must not silently reset `mappings` back to the built-in empty default
+  // and discard a DB-configured mapping list. Each field is gated on its OWN raw shape being valid (not
+  // just "is the key present"), for the same reason as typeLabels above -- e.g. a typo'd
+  // `mappings: "oops"` must never silently replace a DB-configured mapping list with the normalizer's
+  // empty-array fallback. A validly-shaped `mappings` array is still a complete replacement when present
+  // (arrays have no per-item precedence semantics here, and any individually-invalid entries inside it
+  // are dropped by the normalizer, not the array itself), matching the array-replace-wholesale overlay
+  // behavior documented for the private-config layer.
+  if (typeof r.linkedIssueLabelPropagation === "object" && r.linkedIssueLabelPropagation !== null && !Array.isArray(r.linkedIssueLabelPropagation)) {
+    const rawPropagation = r.linkedIssueLabelPropagation as Record<string, unknown>;
+    const validated = normalizeLinkedIssueLabelPropagationConfig(rawPropagation, warnings);
+    const sparsePropagation: Partial<LinkedIssueLabelPropagationConfig> = {};
+    if (typeof rawPropagation.enabled === "boolean") sparsePropagation.enabled = validated.enabled;
+    if (typeof rawPropagation.mode === "string" && (VALID_LINKED_ISSUE_LABEL_PROPAGATION_MODES as readonly string[]).includes(rawPropagation.mode)) {
+      sparsePropagation.mode = validated.mode;
+    }
+    if (Array.isArray(rawPropagation.mappings)) sparsePropagation.mappings = validated.mappings;
+    out.linkedIssueLabelPropagation = sparsePropagation;
+  } else if (r.linkedIssueLabelPropagation !== undefined) {
+    warnings.push(`Manifest "settings.linkedIssueLabelPropagation" must be an object; ignoring it and keeping any existing policy.`);
+  }
   // Contributor blacklist (#1425): `settings.contributorBlacklist` is a list of banned-login entries. Only set it
   // when at least one VALID entry survives normalization, so a malformed block never blanks the DB-configured
   // list via the resolver's `{...dbSettings, ...manifest.settings}` overlay. Normalization warnings are folded in.
@@ -851,17 +1092,48 @@ function parseSettingsOverride(value: JsonValue | undefined, warnings: string[])
     const contributorOpenIssueCap = normalizeOptionalPositiveInteger(r.contributorOpenIssueCap, "settings.contributorOpenIssueCap", warnings);
     if (contributorOpenIssueCap !== null) out.contributorOpenIssueCap = contributorOpenIssueCap;
   }
-  const contributorCapLabel = normalizeOptionalString(r.contributorCapLabel, "settings.contributorCapLabel", warnings);
-  if (contributorCapLabel !== null) out.contributorCapLabel = contributorCapLabel;
+  // #label-scoping: same load-bearing-null idiom as blacklistLabel above.
+  if (r.contributorCapLabel === null) {
+    out.contributorCapLabel = null;
+  } else {
+    const contributorCapLabel = normalizeOptionalString(r.contributorCapLabel, "settings.contributorCapLabel", warnings);
+    if (contributorCapLabel !== null) out.contributorCapLabel = contributorCapLabel;
+  }
+  // CI-run cancellation on a contributor_cap close (#2462): an explicit yml `null` is load-bearing (clears a
+  // DB-configured value back to "unset", falling through to the CONTRIBUTOR_CAP_CANCEL_CI_DEFAULT env var),
+  // matching contributorOpenPrCap's own null-vs-omitted distinction above.
+  if (r.contributorCapCancelCi === null) {
+    out.contributorCapCancelCi = null;
+  } else {
+    const contributorCapCancelCi = normalizeOptionalBoolean(r.contributorCapCancelCi, "settings.contributorCapCancelCi", warnings);
+    if (contributorCapCancelCi !== null) out.contributorCapCancelCi = contributorCapCancelCi;
+  }
   // Review-request nagging cooldown (#2463): throttle a contributor repeatedly pinging @gittensory for review.
   const reviewNagPolicy = normalizeOptionalEnum(r.reviewNagPolicy, "settings.reviewNagPolicy", ["off", "hold", "close"] as const, warnings);
   if (reviewNagPolicy !== null) out.reviewNagPolicy = reviewNagPolicy;
   const reviewNagMaxPings = normalizeOptionalPositiveInteger(r.reviewNagMaxPings, "settings.reviewNagMaxPings", warnings);
   if (reviewNagMaxPings !== null) out.reviewNagMaxPings = reviewNagMaxPings;
   const reviewNagCooldownDays = normalizeOptionalPositiveInteger(r.reviewNagCooldownDays, "settings.reviewNagCooldownDays", warnings);
-  if (reviewNagCooldownDays !== null) out.reviewNagCooldownDays = reviewNagCooldownDays;
-  const reviewNagLabel = normalizeOptionalString(r.reviewNagLabel, "settings.reviewNagLabel", warnings);
-  if (reviewNagLabel !== null) out.reviewNagLabel = reviewNagLabel;
+  if (reviewNagCooldownDays !== null && reviewNagCooldownDays <= MAX_REVIEW_NAG_COOLDOWN_DAYS) out.reviewNagCooldownDays = reviewNagCooldownDays;
+  if (reviewNagCooldownDays !== null && reviewNagCooldownDays > MAX_REVIEW_NAG_COOLDOWN_DAYS) {
+    warnings.push(`Manifest field "settings.reviewNagCooldownDays" must be at most ${MAX_REVIEW_NAG_COOLDOWN_DAYS}; ignoring it.`);
+  }
+  // #label-scoping: same load-bearing-null idiom as blacklistLabel above.
+  if (r.reviewNagLabel === null) {
+    out.reviewNagLabel = null;
+  } else {
+    const reviewNagLabel = normalizeOptionalString(r.reviewNagLabel, "settings.reviewNagLabel", warnings);
+    if (reviewNagLabel !== null) out.reviewNagLabel = reviewNagLabel;
+  }
+  // Maintainer-mention nag moderation (#label-scoping): GitHub logins ALSO throttled under the review-nag
+  // cooldown above, on top of the bot's own @gittensory handle. Only set it when at least one VALID login
+  // survives normalization, so a malformed block never blanks the DB-configured list via the resolver's
+  // `{...dbSettings, ...manifest.settings}` overlay (same reasoning as autoCloseExemptLogins below).
+  if (r.reviewNagMonitoredMentions !== undefined) {
+    const { logins: monitoredMentions, warnings: monitoredMentionWarnings } = normalizeAutoCloseExemptLogins(r.reviewNagMonitoredMentions);
+    warnings.push(...monitoredMentionWarnings);
+    if (monitoredMentions.length > 0) out.reviewNagMonitoredMentions = monitoredMentions;
+  }
   // Shared repo-scoped exemption list (#2463): only set it when at least one VALID login survives
   // normalization, so a malformed block never blanks the DB-configured list via the resolver's overlay.
   if (r.autoCloseExemptLogins !== undefined) {
@@ -879,6 +1151,35 @@ function parseSettingsOverride(value: JsonValue | undefined, warnings: string[])
   }
   const newAccountLabel = normalizeOptionalString(r.newAccountLabel, "settings.newAccountLabel", warnings);
   if (newAccountLabel !== null) out.newAccountLabel = newAccountLabel;
+  // Per-command @gittensory rate limit (#2560): generalizes review-nag's cooldown pattern to every command.
+  const commandRateLimitPolicy = normalizeOptionalEnum(r.commandRateLimitPolicy, "settings.commandRateLimitPolicy", ["off", "hold"] as const, warnings);
+  if (commandRateLimitPolicy !== null) out.commandRateLimitPolicy = commandRateLimitPolicy;
+  const commandRateLimitMaxPerWindow = normalizeOptionalPositiveInteger(r.commandRateLimitMaxPerWindow, "settings.commandRateLimitMaxPerWindow", warnings);
+  if (commandRateLimitMaxPerWindow !== null) out.commandRateLimitMaxPerWindow = commandRateLimitMaxPerWindow;
+  const commandRateLimitAiMaxPerWindow = normalizeOptionalPositiveInteger(r.commandRateLimitAiMaxPerWindow, "settings.commandRateLimitAiMaxPerWindow", warnings);
+  if (commandRateLimitAiMaxPerWindow !== null) out.commandRateLimitAiMaxPerWindow = commandRateLimitAiMaxPerWindow;
+  const commandRateLimitWindowHours = normalizeOptionalPositiveInteger(r.commandRateLimitWindowHours, "settings.commandRateLimitWindowHours", warnings);
+  if (commandRateLimitWindowHours !== null) out.commandRateLimitWindowHours = commandRateLimitWindowHours;
+  // Moderation-rules engine (#selfhost-mod-engine): per-repo override of the global moderation config.
+  const moderationGateMode = normalizeOptionalEnum(r.moderationGateMode, "settings.moderationGateMode", ["inherit", "off", "enabled"] as const, warnings);
+  if (moderationGateMode !== null) out.moderationGateMode = moderationGateMode;
+  // #gate-flagged: normalizeModerationRules returns an EMPTY rules array for two semantically different
+  // inputs -- a genuinely empty yml list (`moderationRules: []`, an intentional "opt every rule out for this
+  // repo") and a MALFORMED one (a non-array, or an array where every entry fails validation) that degrades to
+  // empty as its safe fallback. Applying the malformed case as an override would silently disable every rule
+  // for this repo instead of leaving the DB-configured value intact, so the two must be told apart by the RAW
+  // input's own shape -- not just the normalized result -- before assigning. A PARTIAL list (some valid, some
+  // invalid entries) still applies the surviving valid subset, mirroring autoCloseExemptLogins' behavior.
+  if (r.moderationRules !== undefined) {
+    const { rules, warnings: moderationRuleWarnings } = normalizeModerationRules(r.moderationRules);
+    warnings.push(...moderationRuleWarnings);
+    const intentionalEmptyList = Array.isArray(r.moderationRules) && r.moderationRules.length === 0;
+    if (rules.length > 0 || intentionalEmptyList) out.moderationRules = rules;
+  }
+  const moderationWarningLabel = normalizeModerationLabel(r.moderationWarningLabel);
+  if (moderationWarningLabel !== undefined) out.moderationWarningLabel = moderationWarningLabel;
+  const moderationBannedLabel = normalizeModerationLabel(r.moderationBannedLabel);
+  if (moderationBannedLabel !== undefined) out.moderationBannedLabel = moderationBannedLabel;
   return out;
 }
 
@@ -906,7 +1207,7 @@ function parsePublicSafeText(value: JsonValue | undefined, field: string, warnin
  * throws; invalid/unsafe values are dropped with warnings.
  */
 function parseReviewConfig(value: JsonValue | undefined, warnings: string[]): FocusManifestReviewConfig {
-  const empty: FocusManifestReviewConfig = { present: false, footerText: null, note: null, fields: {}, profile: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] };
+  const empty: FocusManifestReviewConfig = { present: false, footerText: null, note: null, fields: {}, profile: null, securityFocus: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] };
   if (value === undefined || value === null) return empty;
   if (typeof value !== "object" || Array.isArray(value)) {
     warnings.push(`Manifest field "review" must be a mapping; ignoring it.`);
@@ -927,6 +1228,7 @@ function parseReviewConfig(value: JsonValue | undefined, warnings: string[]): Fo
   const footerText = footerRecord ? parsePublicSafeText(footerRecord.text, "review.footer.text", warnings) : null;
   const note = parsePublicSafeText(r.note, "review.note", warnings);
   const profile = parseReviewProfile(r.profile, warnings);
+  const securityFocus = normalizeOptionalBoolean(r.security_focus, "review.security_focus", warnings);
   const inlineComments = normalizeOptionalBoolean(r.inline_comments, "review.inline_comments", warnings);
   const pathInstructions = parseReviewPathInstructions(r.path_instructions, warnings);
   const instructions = parsePublicSafeText(r.instructions, "review.instructions", warnings);
@@ -937,6 +1239,7 @@ function parseReviewConfig(value: JsonValue | undefined, warnings: string[]): Fo
       footerText !== null ||
       note !== null ||
       profile !== null ||
+      securityFocus !== null ||
       inlineComments !== null ||
       pathInstructions.length > 0 ||
       instructions !== null ||
@@ -947,6 +1250,7 @@ function parseReviewConfig(value: JsonValue | undefined, warnings: string[]): Fo
     note,
     fields,
     profile,
+    securityFocus,
     inlineComments,
     pathInstructions,
     instructions,
@@ -1093,6 +1397,7 @@ export function reviewConfigToJson(review: FocusManifestReviewConfig): JsonValue
   if (review.footerText !== null) out.footer = { text: review.footerText };
   if (review.note !== null) out.note = review.note;
   if (review.profile !== null) out.profile = review.profile;
+  if (review.securityFocus !== null) out.security_focus = review.securityFocus;
   if (review.inlineComments !== null) out.inline_comments = review.inlineComments;
   if (review.instructions !== null) out.instructions = review.instructions;
   if (review.pathInstructions.length > 0) out.path_instructions = review.pathInstructions.map((entry) => ({ path: entry.path, instructions: entry.instructions }));
@@ -1126,14 +1431,16 @@ export function resolveReviewPathInstructions(pathInstructions: ReviewPathInstru
   return `\n\nPath-specific review instructions from the maintainer — apply these to the changed files that match each glob:\n${lines.join("\n")}`;
 }
 
-/** Resolve the AI-reviewer overrides (`review.profile` + `review.path_instructions` + `review.exclude_paths`) from
- *  a possibly-null manifest (null = load failure). A null manifest yields the byte-identical defaults. Centralized
- *  so the AI-review caller threads them in one place with the null-manifest branch covered here (unit-tested)
- *  rather than inline in the processor. (#review-profile / #review-path-instructions / #review-exclude-paths) */
-export function resolveReviewPromptOverrides(manifest: FocusManifest | null): { profile: ReviewProfile | null; inlineComments: boolean; pathInstructions: ReviewPathInstruction[]; instructions: string | null; excludePaths: string[] } {
+/** Resolve the AI-reviewer overrides (`review.profile` + `review.security_focus` + `review.path_instructions` +
+ *  `review.exclude_paths`) from a possibly-null manifest (null = load failure). A null manifest yields the
+ *  byte-identical defaults. Centralized so the AI-review caller threads them in one place with the null-manifest
+ *  branch covered here (unit-tested) rather than inline in the processor.
+ *  (#review-profile / #review-security-focus / #review-path-instructions / #review-exclude-paths) */
+export function resolveReviewPromptOverrides(manifest: FocusManifest | null): { profile: ReviewProfile | null; securityFocus: boolean; inlineComments: boolean; pathInstructions: ReviewPathInstruction[]; instructions: string | null; excludePaths: string[] } {
   // inlineComments resolves to a strict boolean — true ONLY when the manifest explicitly set review.inline_comments:
   // true; null/false/absent ⇒ false. The caller ANDs this per-repo toggle with the operator flag + cutover allowlist.
-  return { profile: manifest?.review.profile ?? null, inlineComments: manifest?.review.inlineComments === true, pathInstructions: manifest?.review.pathInstructions ?? [], instructions: manifest?.review.instructions ?? null, excludePaths: manifest?.review.excludePaths ?? [] };
+  // securityFocus resolves the same way — true ONLY when the manifest explicitly set review.security_focus: true.
+  return { profile: manifest?.review.profile ?? null, securityFocus: manifest?.review.securityFocus === true, inlineComments: manifest?.review.inlineComments === true, pathInstructions: manifest?.review.pathInstructions ?? [], instructions: manifest?.review.instructions ?? null, excludePaths: manifest?.review.excludePaths ?? [] };
 }
 
 /** Resolve `review.pre_merge_checks` from a possibly-null manifest (null = load failure ⇒ no checks). Centralized
@@ -1210,7 +1517,26 @@ export function resolveEffectiveSettings(
   manifest: FocusManifest,
   sharedContributorBlacklist: RepositorySettings["contributorBlacklist"] = [],
 ): RepositorySettings {
-  const effective: RepositorySettings = { ...dbSettings, ...manifest.settings };
+  // `typeLabels`/`linkedIssueLabelPropagation` are parsed as SPARSE partials (see parseFocusManifest above),
+  // unlike every other `manifest.settings` field, which is always a complete value ready to overlay the DB
+  // value wholesale via the spread below. Pull them out of the spread and merge each field individually,
+  // manifest override > DB value > built-in default, so a `.gittensory.yml` naming only one key (e.g.
+  // `typeLabels.priority`) can never silently reset the others back to the built-in default and discard a
+  // DB-customized value (#priority-linked-issue-gate).
+  const { typeLabels: typeLabelsOverride, linkedIssueLabelPropagation: linkedIssueLabelPropagationOverride, ...restManifestSettings } = manifest.settings;
+  const effective: RepositorySettings = { ...dbSettings, ...restManifestSettings };
+  if (typeLabelsOverride !== undefined) {
+    const base = dbSettings.typeLabels ?? DEFAULT_TYPE_LABELS;
+    effective.typeLabels = { bug: typeLabelsOverride.bug ?? base.bug, feature: typeLabelsOverride.feature ?? base.feature, priority: typeLabelsOverride.priority ?? base.priority };
+  }
+  if (linkedIssueLabelPropagationOverride !== undefined) {
+    const base = dbSettings.linkedIssueLabelPropagation ?? DEFAULT_LINKED_ISSUE_LABEL_PROPAGATION;
+    effective.linkedIssueLabelPropagation = {
+      enabled: linkedIssueLabelPropagationOverride.enabled ?? base.enabled,
+      mode: linkedIssueLabelPropagationOverride.mode ?? base.mode,
+      mappings: linkedIssueLabelPropagationOverride.mappings ?? base.mappings,
+    };
+  }
   const gate = manifest.gate;
   if (gate.enabled !== null) effective.gateCheckMode = gate.enabled ? "enabled" : "off";
   if (gate.pack !== null) effective.gatePack = gate.pack;
@@ -1219,6 +1545,7 @@ export function resolveEffectiveSettings(
   if (gate.readinessMode !== null) effective.qualityGateMode = gate.readinessMode;
   if (gate.readinessMinScore !== null) effective.qualityGateMinScore = gate.readinessMinScore;
   if (gate.sizeMode !== null) effective.sizeGateMode = gate.sizeMode;
+  if (gate.lockfileIntegrityMode !== null) effective.lockfileIntegrityGateMode = gate.lockfileIntegrityMode;
   if (gate.slopMode !== null) effective.slopGateMode = gate.slopMode;
   if (gate.slopMinScore !== null) effective.slopGateMinScore = gate.slopMinScore;
   if (gate.slopAiAdvisory !== null) effective.slopAiAdvisory = gate.slopAiAdvisory;
@@ -1228,6 +1555,14 @@ export function resolveEffectiveSettings(
   if (gate.aiReviewModel !== null) effective.aiReviewModel = gate.aiReviewModel;
   if (gate.aiReviewAllAuthors !== null) effective.aiReviewAllAuthors = gate.aiReviewAllAuthors;
   if (gate.aiReviewCloseConfidence !== null) effective.aiReviewCloseConfidence = gate.aiReviewCloseConfidence;
+  // Dual-AI combine/onMerge/reviewers overrides (#2567) are projected onto `effective` unclamped here — they are
+  // a REFINEMENT of the operator's AI_REVIEW_PLAN, not a replacement for it, so the actual operator-floor clamp
+  // (onMerge can only TIGHTEN, never loosen) happens where both the per-repo value AND the operator's plan are
+  // visible: `resolveEffectiveAiReviewOnMerge` in services/ai-review.ts, called from the review call site. This
+  // resolver has no access to `env.AI_REVIEW_PLAN`, so it cannot itself enforce the floor.
+  if (gate.aiReviewCombine !== null) effective.aiReviewCombine = gate.aiReviewCombine;
+  if (gate.aiReviewOnMerge !== null) effective.aiReviewOnMerge = gate.aiReviewOnMerge;
+  if (gate.aiReviewReviewers !== null) effective.aiReviewReviewers = gate.aiReviewReviewers;
   if (gate.mergeReadiness !== null) effective.mergeReadinessGateMode = gate.mergeReadiness;
   if (gate.manifestPolicy !== null) effective.manifestPolicyGateMode = gate.manifestPolicy;
   if (gate.selfAuthoredLinkedIssue !== null) effective.selfAuthoredLinkedIssueGateMode = gate.selfAuthoredLinkedIssue;
@@ -1235,6 +1570,11 @@ export function resolveEffectiveSettings(
   if (gate.firstTimeContributorGrace !== null) effective.firstTimeContributorGrace = gate.firstTimeContributorGrace;
   if (gate.premergeContentRecheck !== null) effective.premergeContentRecheck = gate.premergeContentRecheck;
   if (gate.requireFreshRebaseWindowMinutes !== null) effective.requireFreshRebaseWindowMinutes = gate.requireFreshRebaseWindowMinutes;
+  if (gate.claMode !== null) effective.claGateMode = gate.claMode;
+  if (gate.claConsentPhrase !== null) effective.claConsentPhrase = gate.claConsentPhrase;
+  if (gate.claCheckRunName !== null) effective.claCheckRunName = gate.claCheckRunName;
+  if (gate.claCheckRunAppSlug !== null) effective.claCheckRunAppSlug = gate.claCheckRunAppSlug;
+  if (gate.expectedCiContexts !== null) effective.expectedCiContexts = gate.expectedCiContexts;
   // The dashboard "Require linked issue" toggle must not silently diverge from gate blocking: when the
   // boolean is on but linkedIssueGateMode is still off, treat it as a block requirement (#797).
   if (effective.requireLinkedIssue && effective.linkedIssueGateMode === "off") {
@@ -1726,10 +2066,15 @@ function buildPolicyContributionLanes(manifest: FocusManifest): FocusManifestPol
   const lanes: FocusManifestPolicyContributionLane[] = [];
   const safeWantedPaths = manifest.wantedPaths.filter(isFocusManifestPublicSafe);
   const safeBlockedPaths = manifest.blockedPaths.filter(isFocusManifestPublicSafe);
+  const safeTestExpectations = manifest.testExpectations.filter(isFocusManifestPublicSafe);
 
+  // Derive the public preference only from public-safe signals: use the SAME filtered list that surfaces in
+  // validationExpectations below, not the raw testExpectations. Otherwise a manifest whose only test expectation is
+  // public-unsafe (e.g. a wallet/seed phrase) is redacted from the lane yet still flips the public preference to
+  // "preferred" ("…with required validation evidence"), a self-contradictory verdict with no visible basis.
   const directPrPreference: "preferred" | "neutral" | "discouraged" =
     manifest.issueDiscoveryPolicy === "encouraged" ? "discouraged"
-    : safeWantedPaths.length > 0 || manifest.testExpectations.length > 0 ? "preferred"
+    : safeWantedPaths.length > 0 || safeTestExpectations.length > 0 ? "preferred"
     : "neutral";
 
   lanes.push({
@@ -1744,7 +2089,7 @@ function buildPolicyContributionLanes(manifest: FocusManifest): FocusManifestPol
           : "Direct pull requests are accepted when they stay inside maintainer-wanted scope.",
     preferredPaths: safeWantedPaths,
     discouragedPaths: safeBlockedPaths,
-    validationExpectations: manifest.testExpectations.filter(isFocusManifestPublicSafe),
+    validationExpectations: safeTestExpectations,
     publicNotes: manifest.publicNotes.filter(isFocusManifestPublicSafe),
   });
 

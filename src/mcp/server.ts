@@ -322,7 +322,7 @@ const localWriteActionOutputSchema = {
 // #783 plan DAG — STATELESS: the harness holds the plan and passes it back each call; these tools only advance
 // the state machine, so gittensory keeps no record of the miner's plan.
 const planStepStatusEnum = z.enum(["pending", "running", "completed", "failed", "skipped"]);
-const rawPlanStepSchema = z
+export const rawPlanStepSchema = z
   .object({
     id: z.string().min(1).max(100),
     title: z.string().min(1).max(300),
@@ -366,7 +366,7 @@ const proposeActionShape = {
   owner: z.string().min(1),
   repo: z.string().min(1),
   pullNumber: z.number().int().positive(),
-  actionClass: z.enum(["review", "request_changes", "approve", "merge", "close", "label"]),
+  actionClass: z.enum(["review", "request_changes", "approve", "merge", "close", "label", "review_state_label"]),
   reason: z.string().max(500).optional(),
   label: z.string().min(1).max(100).optional(),
   reviewBody: z.string().max(60000).optional(),

@@ -21,6 +21,7 @@ import {
   extractBrowserSessionToken,
   extractCookieValue,
   isAuthorizedGitHubSessionLogin,
+  isMcpReadUnscoped,
   revokeSession,
   timingSafeEqual,
   type AuthIdentity,
@@ -664,6 +665,7 @@ const maintainerSettingsSchema = z
     qualityGateMinScore: z.number().int().min(0).max(100).nullable(),
     mergeReadinessGateMode: z.enum(["off", "advisory", "block"]),
     manifestPolicyGateMode: z.enum(["off", "advisory", "block"]),
+    selfAuthoredLinkedIssueGateMode: z.enum(["off", "advisory", "block"]),
     firstTimeContributorGrace: z.boolean(),
     slopGateMode: z.enum(["off", "advisory", "block"]),
     slopGateMinScore: z.number().int().min(0).max(100).nullable(),
@@ -2981,8 +2983,17 @@ export function createApp() {
     const auth = c.req.header("authorization") ?? "";
     const secret = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     if (!secret) return c.json({ error: "missing_enrollment_secret" }, 401);
-    const result = await brokerOrbToken(c.env, secret);
-    if ("error" in result) return c.json(result, result.error === "invalid_enrollment" ? 401 : 403);
+    const body = await c.req.json().catch(() => null);
+    const forceRefresh = typeof body === "object" && body !== null && (body as { forceRefresh?: unknown }).forceRefresh === true;
+    let result: Awaited<ReturnType<typeof brokerOrbToken>>;
+    try {
+      result = await brokerOrbToken(c.env, secret, { forceRefresh });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(JSON.stringify({ level: "error", event: "orb_broker_mint_failed", message: message.slice(0, 200) }));
+      return c.json({ error: "broker_error" }, 503);
+    }
+    if ("error" in result) return c.json(result, result.error === "invalid_enrollment" ? 401 : result.error === "broker_misconfigured" ? 503 : 403);
     return c.json(result);
   });
 
@@ -4971,6 +4982,14 @@ async function requireContributorAccess(c: ProtectedRouteContext, login: string)
   /* v8 ignore next -- Protected middleware rejects unauthenticated private routes before contributor-scoped route guards. */
   if (!identity) return c.json({ error: "unauthorized" }, 401);
   if (identity.kind === "session" && identity.actor.toLowerCase() !== login.toLowerCase()) return c.json({ error: "forbidden_contributor" }, 403);
+  // The shared, end-user-obtainable GITTENSORY_MCP_TOKEN (static `mcp` identity) must NOT read an ARBITRARY
+  // contributor's private decision pack / profile / notifications over HTTP either — this mirrors the MCP tool
+  // surface's guard for the identical data (GittensoryMcp.requireContributorAccess, #2455). Without this, the
+  // HTTP surface silently grants what the MCP surface explicitly denies for the very same token. Only the full
+  // MCP_READ_REPO_ALLOWLIST wildcard opt-in unlocks it; operator-only `api`/`internal` tokens stay trusted by design.
+  if (identity.kind === "static" && identity.actor === "mcp" && !isMcpReadUnscoped(c.env.MCP_READ_REPO_ALLOWLIST)) {
+    return c.json({ error: "forbidden_contributor" }, 403);
+  }
   return null;
 }
 

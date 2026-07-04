@@ -1267,7 +1267,14 @@ export function isTestFile(file: string): boolean {
 }
 
 export function isCodeFile(file: string): boolean {
-  return /\.(ts|tsx|js|jsx|py|rb|rs|kt|scala|java|go|sql)$/i.test(file) && !isTestFile(file);
+  // cs/swift/groovy/php round out the JVM/.NET/Swift/PHP set: isTestPath already
+  // recognizes their `SomethingTest(s)`/`Spec` test files, so their source must
+  // count as code too — otherwise a C#/Swift/Groovy/PHP source file is neither test
+  // nor code in the local scorer.
+  return (
+    /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|rb|rs|kt|scala|java|go|sql|cs|swift|groovy|php)$/i.test(file) &&
+    !isTestFile(file)
+  );
 }
 
 function sameRepo(left: string, right: string): boolean {

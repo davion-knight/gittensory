@@ -52,7 +52,16 @@ export const repositorySettings = sqliteTable("repository_settings", {
   checkRunDetailLevel: text("check_run_detail_level").notNull().default("minimal"),
   gateCheckMode: text("gate_check_mode").notNull().default("off"),
   gatePack: text("gate_pack").notNull().default("gittensor"),
-  linkedIssueGateMode: text("linked_issue_gate_mode").notNull().default("block"),
+  // Missing a linked issue is advisory-only by default -- issues aren't always available, so it only
+  // blocks when a repo explicitly opts in (linkedIssueGateMode: "block" or the requireLinkedIssue toggle;
+  // see resolveEffectiveSettings in signals/focus-manifest.ts). This default was "block" until #selfhost-
+  // linked-issue-gate-drift, which also backfills any row an earlier migration (0023/0025) persisted as
+  // "block" without an explicit opt-in (migrations/0102_fix_linked_issue_gate_mode_default.sql). The raw
+  // SQLite column still has a DEFAULT 'block' from migration 0023 -- SQLite has no ALTER COLUMN SET DEFAULT,
+  // so fixing that requires a full table rebuild, not done here since no write path ever omits this field
+  // (see test/unit/schema-timestamp-defaults.test.ts). This .default("advisory") is what actually applies,
+  // client-side, on any insert that omits the field.
+  linkedIssueGateMode: text("linked_issue_gate_mode").notNull().default("advisory"),
   duplicatePrGateMode: text("duplicate_pr_gate_mode").notNull().default("block"),
   qualityGateMode: text("quality_gate_mode").notNull().default("advisory"),
   qualityGateMinScore: integer("quality_gate_min_score"),
@@ -75,6 +84,14 @@ export const repositorySettings = sqliteTable("repository_settings", {
   // regardless of the label a repo uses.
   blacklistLabel: text("blacklist_label").notNull().default("slop"),
   createMissingLabel: integer("create_missing_label", { mode: "boolean" }).notNull().default(true),
+  // #label-decoupling: independently gates the per-PR TYPE label (gittensor:bug/feature/priority),
+  // distinct from autoLabelEnabled (the base gittensor context label) and the public-surface gate.
+  typeLabelsEnabled: integer("type_labels_enabled", { mode: "boolean" }).notNull().default(true),
+  // Per-repo override of the three TYPE label NAMES (#priority-linked-issue-gate): { bug, feature, priority }.
+  typeLabelsJson: text("type_labels_json").notNull().default("{}"),
+  // Linked-issue label propagation (#priority-linked-issue-gate): the only mechanism that can select the
+  // configured priority label -- never inferred from title/files/AI/PR-labels. Default disabled, no mappings.
+  linkedIssueLabelPropagationJson: text("linked_issue_label_propagation_json").notNull().default("{}"),
   publicSurface: text("public_surface").notNull().default("comment_and_label"),
   includeMaintainerAuthors: integer("include_maintainer_authors", { mode: "boolean" }).notNull().default(false),
   requireLinkedIssue: integer("require_linked_issue", { mode: "boolean" }).notNull().default(false),
@@ -92,11 +109,19 @@ export const repositorySettings = sqliteTable("repository_settings", {
   contributorOpenPrCap: integer("contributor_open_pr_cap"),
   contributorOpenIssueCap: integer("contributor_open_issue_cap"),
   contributorCapLabel: text("contributor_cap_label").notNull().default("over-contributor-limit"),
+  // Cancel in-flight CI runs on a contributor_cap close (#2462): null = unset, falls back to the
+  // CONTRIBUTOR_CAP_CANCEL_CI_DEFAULT env var (nullable, unlike a plain boolean toggle, so an explicit `false`
+  // is distinguishable from "not configured" for that fallback). Only meaningful when the App installation has
+  // granted actions:write -- degrades gracefully (logs, never blocks the close) otherwise.
+  contributorCapCancelCi: integer("contributor_cap_cancel_ci", { mode: "boolean" }),
   // Review-request nagging cooldown (#2463, anti-abuse): default 'off' (disabled).
   reviewNagPolicy: text("review_nag_policy").notNull().default("off"),
   reviewNagMaxPings: integer("review_nag_max_pings").notNull().default(3),
   reviewNagCooldownDays: integer("review_nag_cooldown_days").notNull().default(5),
   reviewNagLabel: text("review_nag_label").notNull().default("review-nag-cooldown"),
+  // Maintainer-mention nag moderation (#label-scoping): a JSON array of GitHub logins ALSO throttled under the
+  // review-nag cooldown above, on top of the bot's own `@gittensory` handle. Default '[]' (no logins watched).
+  reviewNagMonitoredMentionsJson: text("review_nag_monitored_mentions_json").notNull().default("[]"),
   // Shared repo-scoped exemption list (#2463): a JSON array of GitHub logins.
   autoCloseExemptLoginsJson: text("auto_close_exempt_logins_json").notNull().default("[]"),
   // Force-rebase-before-merge window in minutes (#2552): null = never force (default). Enforcement lands in
@@ -106,6 +131,19 @@ export const repositorySettings = sqliteTable("repository_settings", {
   // runAgentMaintenancePlanAndExecute, not here.
   accountAgeThresholdDays: integer("account_age_threshold_days"),
   newAccountLabel: text("new_account_label").notNull().default("new-account"),
+  // Per-command @gittensory rate limit (#2560, anti-abuse): generalizes review-nag's cooldown pattern to every
+  // command, keyed by (actor, command, targetKey) independent of review-nag's own thread-author-only scope.
+  commandRateLimitPolicy: text("command_rate_limit_policy").notNull().default("off"),
+  commandRateLimitMaxPerWindow: integer("command_rate_limit_max_per_window").notNull().default(20),
+  commandRateLimitAiMaxPerWindow: integer("command_rate_limit_ai_max_per_window").notNull().default(5),
+  commandRateLimitWindowHours: integer("command_rate_limit_window_hours").notNull().default(24),
+  // Moderation-rules engine (#selfhost-mod-engine): per-repo overrides layered over global_moderation_config.
+  // 'inherit' (default) defers to the global master switch; 'off'/'enabled' force this repo regardless of it.
+  moderationGateMode: text("moderation_gate_mode").notNull().default("inherit"),
+  // Nullable: null = inherit the global rule set / label text, never "unset to empty".
+  moderationRulesJson: text("moderation_rules_json"),
+  moderationWarningLabel: text("moderation_warning_label"),
+  moderationBannedLabel: text("moderation_banned_label"),
   createdAt: text("created_at").notNull().$defaultFn(() => nowIso()),
   updatedAt: text("updated_at").notNull().$defaultFn(() => nowIso()),
 });
@@ -697,6 +735,7 @@ export const installationHealth = sqliteTable("installation_health", {
   eventsJson: text("events_json").notNull().default("[]"),
   checkedAt: text("checked_at").notNull(),
   errorSummary: text("error_summary"),
+  authMode: text("auth_mode").notNull().default("local"),
 });
 
 export const advisories = sqliteTable("advisories", {
@@ -1187,6 +1226,11 @@ export const aiReviewCache = sqliteTable(
     reviewerCount: integer("reviewer_count").notNull(),
     findingsJson: text("findings_json").notNull().default("[]"),
     metadataJson: text("metadata_json").notNull().default("{}"),
+    // #regate-churn: 1 (default) = a genuine, indefinitely-reusable review; 0 = a non-cacheable outcome
+    // (consensus defect / inconclusive / lock-contention placeholder) that is still PERSISTED so a repeated
+    // scheduled sweep pass at the identical head+fingerprint can reuse it for a bounded cooldown instead of
+    // re-spending an LLM call on every tick, without ever being treated as a durable, indefinitely-trustworthy hit.
+    cacheable: integer("cacheable").notNull().default(1),
     createdAt: text("created_at").notNull().$defaultFn(() => nowIso()),
   },
   (table) => ({

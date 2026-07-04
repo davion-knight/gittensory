@@ -101,9 +101,13 @@ gate:
   # Default: gittensor.
   pack: gittensor
 
-  # Linked-issue gate. off | advisory | block. Default: advisory.
-  # (If the dashboard "Require linked issue" toggle is on but this is `off`,
-  #  it is auto-promoted to `block`.)
+  # Linked-issue gate — what happens when a PR has NO linked issue at all. off | advisory | block.
+  # Default: advisory (a missing issue is surfaced in the review panel but never blocks the gate; issues
+  # aren't always available, e.g. small/self-evident fixes). Set `block` here, or turn on the dashboard
+  # "Require linked issue" toggle, to make a missing issue an explicit opt-in blocker.
+  # (If the dashboard toggle is on but this is still `off`, it is auto-promoted to `block`.)
+  # This is UNRELATED to closing a PR that links an INELIGIBLE issue (owner-assigned, wrong label, etc.) —
+  # that is a separate, deterministic rule, not this gate.
   linkedIssue: advisory
 
   # Duplicate-PR gate — detects duplicate/superseding PRs.
@@ -142,6 +146,49 @@ gate:
   # dashboard toggle; this can only be set here.
   size:
     mode: off
+
+  # Lockfile-tamper-risk gate. Scans a changed package-lock.json diff for a
+  # resolved/integrity value that changed WITHOUT the same package's version
+  # changing in a changed package.json, or a resolved URL outside
+  # registry.npmjs.org — the classic supply-chain hand-edit tell. Distinct
+  # from the OSV.dev known-CVE dependency scan (a different threat model).
+  # off | advisory | block. Default: off. Config-as-code only — no DB column
+  # or dashboard toggle; this can only be set here.
+  lockfileIntegrity: off
+
+  # CLA / license-compatibility gate (#2564). Confirms contributor license-agreement consent before a PR
+  # can auto-merge — the gittensory analog of a "CLA assistant" bot. off | advisory | block. Default: off.
+  #   advisory — surfaces a cla_consent_missing finding but never blocks.
+  #   block    — also hard-blocks (one-shot close for a contributor) when neither detection method
+  #              below confirms consent.
+  # Config-as-code only — no DB column or dashboard toggle; this can only be set here.
+  claMode: off
+  cla:
+    # A phrase gittensory looks for in the PR description (case-insensitive substring match), mirroring
+    # review.pre_merge_checks' descriptionContains. String or null. Default: null (not configured).
+    consentPhrase: "I have read and agree to the CLA"
+    # Name of a separate CLA-bot check-run this repo also runs (e.g. a CLA Assistant GitHub Action). A
+    # success/neutral conclusion for a check-run with this exact name also satisfies consent only when the
+    # run was produced by checkRunAppSlug. Either method configured is enough; both may be set. String or
+    # null. Default: null (not configured).
+    checkRunName: null
+    # Trusted GitHub App slug that must have produced checkRunName. Required for check-run detection so a
+    # contributor-controlled same-name check-run cannot satisfy a blocking CLA/legal gate. String or null.
+    # Default: null (not configured).
+    checkRunAppSlug: null
+
+  # CI check/status context names to treat as REQUIRED when GitHub branch protection returns no
+  # readable required-status-checks (unconfigured, or a 403 from a token lacking
+  # administration:read — common for GitHub App installations, especially self-host). Merged with
+  # any branch-protection required contexts when both are readable; used ALONE when branch
+  # protection is null/empty. A context listed here that never appears on the commit stays
+  # pending; a completed red check for a listed context fails the gate; every listed context
+  # settled clean resolves to a verified "passed" (no completeness warning). List of strings, or
+  # omit. Default: not configured (keeps today's fold-all fail-closed behavior when branch
+  # protection is also unreadable). Config-as-code only — no DB column or dashboard toggle.
+  expectedCiContexts:
+    - build
+    - test
 
   # Composite merge-readiness gate (no min score).
   # off | advisory | block. Default: off.
@@ -242,6 +289,13 @@ settings:
   publicSignalLevel: standard
 
   # Publish a GitHub check-run. off | enabled. Default: off.
+  # Independent, legacy advisory surface (#2691) -- separate from, and not gated
+  # by, the required `Gittensory Orb Review Agent` gate check under `gate:`
+  # above. At the default `checkRunDetailLevel: minimal` below it posts no
+  # findings at all; at standard/deep it only re-renders findings already shown
+  # in the gate check and the PR comment. One-shot self-host installs should
+  # leave this at the default `off` unless you specifically want a second,
+  # low-detail check-run surface alongside the required gate check.
   checkRunMode: off
 
   # Check-run detail. minimal | standard | deep. Default: minimal.
@@ -256,6 +310,43 @@ settings:
 
   # The label name to apply. String. Default: gittensor.
   gittensorLabel: gittensor
+
+  # Apply the per-PR TYPE/taxonomy label -- bug/feature by the PR title, or priority via
+  # `linkedIssueLabelPropagation` below (#label-decoupling). Independent of `autoLabelEnabled` above
+  # (which only governs the base `gittensorLabel` context label): a type label is internal triage
+  # metadata, so it applies to every PR regardless of author type (bot/maintainer/missing author) or
+  # `publicAudienceMode`/`publicSurface`, UNLESS `publicAudienceMode: gittensor_only` is muting this
+  # PR's author entirely (that mode's whole point is total silence for a non-confirmed-miner author).
+  # Bool. Default: true.
+  typeLabelsEnabled: true
+
+  # Per-repo override of the three TYPE label NAMES. Omit any key to keep its default. Map with
+  # string values bug/feature/priority. Default: gittensor:bug / gittensor:feature / gittensor:priority.
+  # typeLabels:
+  #   bug: gittensor:bug
+  #   feature: gittensor:feature
+  #   priority: gittensor:priority
+
+  # Linked-issue label propagation (#priority-linked-issue-gate): the ONLY mechanism that can select a
+  # label like `gittensor:priority` -- it is NEVER inferred from a PR's title, changed files, AI
+  # output, or existing PR labels, only ever copied from a linked/closing issue ("Fixes #123") that
+  # ALREADY carries the configured issue label. Generic beyond the priority use case: any issue label
+  # can map to any PR label. `removeOtherTypeLabels: true` REPLACES the type label entirely (bug/
+  # feature are removed), matching how `gittensor:priority` behaves today; `false` applies the mapped
+  # label ADDITIVELY alongside the normal title-based bug/feature label, leaving it untouched -- useful
+  # for a mapping unrelated to the bug/feature/priority triad (e.g. a `customer:vip` issue label
+  # copied to a `triage:vip` PR label). Disabled by default (no mappings) -- a self-hoster opts in per
+  # repo. If your labels carry reward or moderation weight, configure this in PRIVATE per-repo/global
+  # config (see `config/examples/README.md`) rather than the public `.gittensory.yml`, so contributors
+  # cannot see the exact mapping rules. A per-repo `mappings` override in the private-config layer
+  # REPLACES the global default list wholesale -- it does not merge with it.
+  # linkedIssueLabelPropagation:
+  #   enabled: true
+  #   mode: exclusive_type_label
+  #   mappings:
+  #     - issueLabel: gittensor:priority
+  #       prLabel: gittensor:priority
+  #       removeOtherTypeLabels: true
 
   # Create the label if it does not yet exist. Bool. Default: true.
   createMissingLabel: true
@@ -286,8 +377,33 @@ settings:
   # Bool. Default: false.
   agentDryRun: false
 
-  # Autonomy dial — per-action-class level (observe … auto).
-  # Map. Default: {} (= observe everywhere, deny-by-default).
+  # Four independent label families, none of which gates or silently disables another (#label-decoupling,
+  # #label-scoping):
+  #   1. Context label (`gittensorLabel`, gated by `autoLabelEnabled` above) — the base per-PR marker shown
+  #      to the public surface, subject to `publicAudienceMode`/`publicSurface`/author-qualification.
+  #   2. Taxonomy/type label (`gittensor:bug`/`gittensor:feature`/`gittensor:priority`, gated by
+  #      `typeLabelsEnabled` above) — internal triage metadata, applied independently of #1. bug/
+  #      feature come from the PR title; priority ONLY from `linkedIssueLabelPropagation` above —
+  #      never inferred from title, files, AI, or existing PR labels (#priority-linked-issue-gate).
+  #   3. Autonomy-outcome labels (`gittensory:ready-to-merge` etc.) — gated by the `review_state_label`
+  #      autonomy class below, advisory commentary on the bot's own verdict.
+  #   4. Anti-abuse enforcement labels (blacklist/contributor-cap/review-nag) — gated by the `close`
+  #      autonomy class below, applied alongside the close action they accompany.
+  #
+  # Autonomy dial — per-action-class level (observe … auto). Classes: review, request_changes, approve,
+  # merge, close, label, review_state_label, update_branch. Map. Default: {} (= observe everywhere,
+  # deny-by-default).
+  #
+  # `label` vs `review_state_label` (#label-scoping): these are SEPARATE, independent dials.
+  #   - `label` alone no longer applies any planner-driven label by itself. The anti-abuse enforcement
+  #     labels (blacklist/contributor-cap/review-nag) ride on the SAME dial as their accompanying close
+  #     (`close`, below) — set `close: auto` and they close-and-label together with no `label` grant needed.
+  #   - `review_state_label` gates the bot's own disposition-communication labels only:
+  #     gittensory:ready-to-merge / gittensory:changes-requested / gittensory:needs-human-review /
+  #     gittensory:migration-collision. These are advisory signals about the bot's own verdict, not
+  #     enforcement — for a one-shot review model (merge/close/hold through the required gate check, no
+  #     back-and-forth) leave this at the default `observe` so they never appear; set it to `auto` only if
+  #     you specifically want that running commentary as GitHub labels.
   autonomy: {}
 
   # Auto-maintain policy for merges the agent is allowed to perform.
@@ -317,7 +433,16 @@ settings:
   # contributorOpenIssueCap: 5
 
   # Label applied to a PR/issue closed for exceeding a cap above. String. Default: over-contributor-limit.
+  # Gated on `autonomy.close` (#label-scoping), not `autonomy.label` — closing WITHOUT this label is
+  # available too: set this to explicit `null` (not just omitted) to close silently, with no label.
   # contributorCapLabel: over-contributor-limit
+
+  # Cancel in-flight CI runs when a PR is auto-closed for exceeding contributorOpenPrCap above (#2462).
+  # Requires the App installation to have granted the `actions: write` permission -- degrades gracefully
+  # (skipped + logged, the close itself still succeeds) when it hasn't. Bool or omit/null to fall back to
+  # the CONTRIBUTOR_CAP_CANCEL_CI_DEFAULT env var. Default: null (falls back to the env var, itself off
+  # by default).
+  # contributorCapCancelCi: true
 
   # Review-request nagging cooldown (#2463, anti-abuse): throttle a non-owner/non-admin/non-bot
   # contributor who repeatedly pings @gittensory for review on the same PR/issue. "hold" replies with a
@@ -325,8 +450,19 @@ settings:
   # a dedicated closeIssue primitive lands) with a clear reason. Off by default.
   # reviewNagPolicy: off      # off | hold | close. Default: off.
   # reviewNagMaxPings: 3      # Positive integer. Pings above this within the cooldown window trigger the policy. Default: 3.
-  # reviewNagCooldownDays: 5  # Positive integer. Window the ping count is measured over. Default: 5.
+  # reviewNagCooldownDays: 5  # Positive integer up to 365. Window the ping count is measured over. Default: 5.
   # reviewNagLabel: review-nag-cooldown  # Label applied alongside the hold/close action. Default: review-nag-cooldown.
+  #                                       # Gated on autonomy.close (#label-scoping); set to explicit `null` to
+  #                                       # close/hold without any label.
+
+  # Maintainer-mention nag moderation (#label-scoping): GitHub logins ALSO throttled under the SAME
+  # reviewNagPolicy/reviewNagMaxPings/reviewNagCooldownDays/reviewNagLabel cooldown above, on top of the
+  # bot's own @gittensory handle — e.g. a contributor who keeps tagging a specific maintainer for review
+  # instead of (or in addition to) pinging @gittensory. Counted independently per mentioned login and
+  # independently of the @gittensory counter. Only fires for the thread's OWN author, never a third party
+  # commenting on someone else's thread; owner/admin/automation-bot/autoCloseExemptLogins are always exempt.
+  # List of GitHub logins. Default: [] (no logins watched).
+  # reviewNagMonitoredMentions: [your-maintainer-login]
 
   # Shared repo-scoped exemption list (#2463): GitHub logins never throttled/closed by gittensory's
   # deterministic anti-abuse mechanisms (review-nag cooldown today; the per-contributor open-item cap
@@ -339,3 +475,12 @@ settings:
   # Never fires for the repo owner, admin logins, or automation bots. PR-path only. Off by default.
   # accountAgeThresholdDays: null  # Positive integer, or null/omitted to disable. Default: null (off).
   # newAccountLabel: new-account  # Label applied to a below-threshold-age account's PR. Default: new-account.
+
+  # Per-command @gittensory rate limit (#2560, anti-abuse): generalizes review-nag's cooldown pattern to
+  # EVERY @gittensory command (help/ask/preflight/blockers/... and the maintainer queue-digest commands),
+  # not just review-request pings — independent of review-nag's own thread-author-only scope. "hold"
+  # replies with a cooldown notice and skips the command's own dispatch. Off by default.
+  # commandRateLimitPolicy: off             # off | hold. Default: off.
+  # commandRateLimitMaxPerWindow: 20        # Positive integer. Per-command invocation limit for a CHEAP command (cache-only, no AI call) within the window. Default: 20.
+  # commandRateLimitAiMaxPerWindow: 5       # Positive integer. Tighter limit for an AI-cost-bearing command (ask/blockers/preflight/reviewability/packet/duplicate-check/next-action/repo-fit). Default: 5.
+  # commandRateLimitWindowHours: 24         # Positive integer. Rolling window (hours) both limits above count against. Default: 24.

@@ -25,14 +25,26 @@ export type JobMessage =
       attempt: number;
     }
   | {
-      // One bounded re-gate unit fanned out by the scheduled sweep (#audit-sweep-fanout): re-review + stamp a
-      // single PR. Each candidate becomes its own individually-retryable, rate-limited queue message so the heavy
-      // re-review work interleaves with other jobs instead of monopolizing the consumer for all 25 at once.
+      // One bounded re-gate unit: re-review + stamp a single PR. Each candidate becomes its own individually-
+      // retryable, rate-limited queue message so the heavy re-review work interleaves with other jobs instead
+      // of monopolizing the consumer. Producers: the scheduled sweep's stale-candidate fan-out
+      // (#audit-sweep-fanout, deliveryId prefixed "regate-sweep:" — genuinely deferrable maintenance) and the
+      // sweep's own outage-repair fan-out (deliveryId prefixed "regate-repair:" — a PR missing a current-head
+      // Gate check or public-surface publish); a trailing coalesced re-review after a webhook burst; an
+      // over-cap sibling wake; a linked-issue-change re-review. EXCEPT for the "regate-sweep:" prefix, every
+      // producer carries the real webhook/event deliveryId that caused it — current-HEAD contributor-PR-review
+      // work, never background maintenance (isScheduledRegateSweepJob / githubRateLimitAdmissionTargetForJob in
+      // ../selfhost/queue-common.ts, #selfhost-queue-liveness).
       type: "agent-regate-pr";
       deliveryId: string;
       repoFullName: string;
       prNumber: number;
       installationId: number;
+      // #regate-churn (req 8): an explicit manual re-gate request — bypasses the AI review cache and the
+      // bounded non-cacheable-reuse cooldown so it always pays for a fresh opinion. No current scheduled or
+      // webhook-driven caller sets this; it exists so a manual trigger has a supported way to force a fresh
+      // pass instead of reusing a recent (possibly disputed) result.
+      force?: boolean | undefined;
     }
   | {
       type: "refresh-registry";
@@ -155,9 +167,13 @@ export type JobMessage =
       runId: string;
     }
   | {
+      // Batched (#selfhost-maintenance-self-pin): every notification event detected from ONE webhook delivery
+      // (a review event plus any issue-watch matches) rides in a single job, instead of one job per event --
+      // that was flooding the maintenance lane with a job per watcher on a popular newly-opened issue. Always
+      // non-empty at enqueue time (see processors.ts); the processor evaluates every event in the batch.
       type: "notify-evaluate";
       requestedBy: "webhook" | "test";
-      event: DetectedNotificationEvent;
+      events: DetectedNotificationEvent[];
     }
   | {
       type: "notify-deliver";
@@ -208,6 +224,17 @@ export type JobMessage =
       // Enqueued by the cron every sweep cycle (≈2 min) ONLY when ORB_BROKER_ENABLED is set.
       type: "retry-orb-relay";
       requestedBy: "schedule" | "test";
+    }
+  | {
+      // Self-host backlog-convergence sweep (#selfhost-backlog-convergence): finds open PRs whose public review
+      // surface was never published for their current head (a blind spot the periodic re-gate sweep's dispatch-
+      // time stamping can miss — see selfhost/backlog-convergence.ts) and fans out one `agent-regate-pr` job per
+      // candidate. No `repoFullName` = fan-out: enqueue one per convergence-eligible repo, mirroring
+      // "agent-regate-sweep". With `repoFullName` = sweep that one repo's stale-surface open PRs.
+      type: "backlog-convergence-sweep";
+      requestedBy: "schedule" | "api" | "test";
+      repoFullName?: string;
+      installationId?: number;
     };
 
 export type GitHubWebhookPayload = {
@@ -470,6 +497,11 @@ export type PullRequestRecord = {
    *  stale-surface diagnostics, not as a hard re-review skip: GitHub comments/checks can still be stale or partial
    *  while this marker matches headSha. Publish-written; read straight from the row. */
   lastPublishedSurfaceSha?: string | null | undefined;
+  /** File paths changed by this open PR, when the caller has already resolved them (e.g. from the
+   *  `pull_request_files` cache). Absent/undefined when not resolved — callers must not assume an empty array
+   *  means "no files changed". Mirrors {@link RecentMergedPullRequestRecord.changedFiles} so the same
+   *  collision/preflight path-overlap scoring works for open PRs, not just merged history. */
+  changedFiles?: string[] | undefined;
 };
 
 export type IssueRecord = {
@@ -509,6 +541,24 @@ export type GateRuleMode = "off" | "advisory" | "block";
  *  consensus) block ANY author, with no emissions/registry/Gittensor coupling — so the gate runs on any repo. */
 export type GatePolicyPack = "gittensor" | "oss-anti-slop";
 
+/**
+ * How the independent AI-reviewer opinions are combined into ONE gate decision (#dual-ai-combiner). Canonical
+ * definition lives here (not in `services/ai-review.ts`, which re-exports it) because both `RepositorySettings`
+ * below and `signals/focus-manifest.ts` need it, and BOTH are imported by the UI workspace — `services/ai-review.ts`
+ * pulls in ambient Cloudflare Workers types (`Env`, `D1Database`, …) the UI's tsconfig `lib` doesn't declare, so a
+ * `import("../services/ai-review").CombineStrategy` type-only reference from either file would still drag that
+ * whole module graph into the UI's typecheck and break it (#2567 follow-up fix).
+ *   • `single`     — one reviewer; its verdict IS the decision (a named blocker blocks).
+ *   • `consensus`  — two reviewers; block ONLY when BOTH name a blocker; lone blocker → split (hold). The
+ *                    historical cloud behavior — the default, so an unset `combine` is byte-identical.
+ *   • `synthesis`  — two reviewers run separately, then merge into ONE decision (no split/hold-on-disagree):
+ *                    `onMerge: either` blocks if EITHER flags a blocker; `both` only if all do.
+ */
+export type CombineStrategy = "single" | "consensus" | "synthesis";
+/** Synthesis merge rule — block if `either` reviewer flags a blocker, or only when `both` agree. See
+ *  {@link CombineStrategy} for why the canonical definition lives here rather than `services/ai-review.ts`. */
+export type OnMerge = "either" | "both";
+
 export type RepositorySettings = {
   repoFullName: string;
   commentMode: "off" | "detected_contributors_only" | "all_prs";
@@ -532,6 +582,39 @@ export type RepositorySettings = {
    *  >= 10 changed files OR >= 1000 changed (added+deleted) lines that would otherwise pass is HELD for manual review
    *  (neutral gate → "manual" verdict), never auto-merged and never a hard failure. Opt-in via `gate.size.mode`. */
   sizeGateMode?: GateRuleMode | undefined;
+  /** Lockfile-tamper-risk gate (#2563). `off` (default/absent) = no scan; `advisory`/`block` = a changed
+   *  `package-lock.json` whose diff changes a `resolved`/`integrity` value WITHOUT the same package's version
+   *  changing in a changed `package.json`, or whose `resolved` URL points outside `registry.npmjs.org`, produces
+   *  a `lockfile_tamper_risk` finding (`block` additionally hard-blocks). Distinct from the OSV.dev CVE analyzer
+   *  in review-enrichment — this is a tamper/integrity-substitution check, not a known-CVE check. Config-as-code
+   *  only — no DB column or dashboard toggle; set via `.gittensory.yml gate.lockfileIntegrity`. */
+  lockfileIntegrityGateMode?: GateRuleMode | undefined;
+  /** CLA / license-compatibility gate (#2564). `off` (default/absent) = no CLA check at all; `advisory`/`block` =
+   *  evaluate the configured detection method(s) (`claConsentPhrase` and/or `claCheckRunName` + `claCheckRunAppSlug`) and raise a
+   *  `cla_consent_missing` finding when neither confirms consent — `block` also hard-blocks the gate. Config-as-code
+   *  only (no DB column, mirrors sizeGateMode) — set via `.gittensory.yml gate.claMode`. */
+  claGateMode?: GateRuleMode | undefined;
+  /** `gate.cla.consentPhrase`: a public-safe-filtered phrase a maintainer requires somewhere in the PR body (e.g.
+   *  "I have read and agree to the CLA"), matched case-insensitively. `null`/absent ⇒ phrase-match detection is not
+   *  configured. Config-as-code only, alongside {@link claGateMode}. */
+  claConsentPhrase?: string | null | undefined;
+  /** `gate.cla.checkRunName`: the name of a separate CLA-bot check-run this repo also runs (e.g. "CLA Assistant
+   *  Lite"). A `success`/`neutral` conclusion for a check-run with this exact name (case-insensitive), produced
+   *  by `claCheckRunAppSlug`, also satisfies consent. `null`/absent ⇒ check-run detection is not configured.
+   *  Config-as-code only, alongside {@link claGateMode}. */
+  claCheckRunName?: string | null | undefined;
+  /** `gate.cla.checkRunAppSlug`: the trusted GitHub App slug that must have produced `claCheckRunName`. Required
+   *  for check-run detection so contributor-controlled same-name runs cannot satisfy a blocking CLA gate. */
+  claCheckRunAppSlug?: string | null | undefined;
+  /** `gate.expectedCiContexts` (#selfhost-ci-verification): maintainer-declared CI check/status context names to
+   *  treat as required when GitHub branch protection returns no readable required-status-checks (unconfigured,
+   *  or a 403 from a token lacking `administration:read` — common for GitHub App installations). Merged with any
+   *  branch-protection required contexts when both exist; used ALONE when branch protection is null/empty; a
+   *  repo with neither configured keeps the existing fold-all fail-closed behavior. A context missing from the
+   *  commit ⇒ pending; a completed red check for a listed context ⇒ failed; every listed context settled clean
+   *  ⇒ verified passed (no `ciCompletenessWarning`). Config-as-code only — no DB column; set via
+   *  `.gittensory.yml gate.expectedCiContexts`. */
+  expectedCiContexts?: ReadonlyArray<string> | null | undefined;
   /** Dry-run disposition (#gate-dryrun). When true, the gate renders the would-be merge/close/manual verdict (every
    *  advisory sub-gate promoted to block) WITHOUT enforcing — the posted check stays non-blocking. Lets advisory mode
    *  preview exactly what it would do before the maintainer flips to real enforcement. Default off. */
@@ -594,6 +677,27 @@ export type RepositorySettings = {
    *  gate.aiReview.closeConfidence` (no dashboard/DB column); unset ⇒ the gate uses the 0.93 default. Clamped to
    *  [0,1] at parse time. */
   aiReviewCloseConfidence?: number | null | undefined;
+  /** Per-repo dual-AI combine-strategy override (#2567). Config-as-code only — set via `.gittensory.yml
+   *  gate.aiReview.combine` (no dashboard/DB column); unset ⇒ the self-host operator's `AI_REVIEW_PLAN.combine`
+   *  boot config (or `consensus` if the operator set nothing). A REFINEMENT of the operator's plan, not a
+   *  bypass — `runGittensoryAiReview` clamps the resolved `onMerge` to the operator's floor (see
+   *  {@link aiReviewOnMerge}); `combine` itself carries no floor semantics (single/consensus/synthesis are not
+   *  ordered by strictness). */
+  aiReviewCombine?: CombineStrategy | null | undefined;
+  /** Per-repo `synthesis` merge-rule override (#2567): `either` blocks on ANY one reviewer's blocker (the
+   *  STRICTER rule); `both` blocks only when every reviewer agrees (the more PERMISSIVE rule). Config-as-code
+   *  only — set via `.gittensory.yml gate.aiReview.onMerge` (no dashboard/DB column). A repo override can only
+   *  TIGHTEN the operator's `AI_REVIEW_PLAN.onMerge` floor (e.g. `either` → `either` is a no-op; `both` → an
+   *  attempted loosening is clamped back to `either`). When the operator has not set an `onMerge` floor, any
+   *  per-repo value is honored unclamped. See `resolveEffectiveAiReviewOnMerge` in `services/ai-review.ts`. */
+  aiReviewOnMerge?: OnMerge | null | undefined;
+  /** Per-repo reviewer-pair override (#2567): named self-host providers (e.g. `{ model: "claude-code" }`,
+   *  `{ model: "codex" }`) to run instead of the operator's `AI_REVIEW_PLAN.reviewers` (or the free Workers-AI
+   *  pair when the operator configured none). Config-as-code only — set via `.gittensory.yml
+   *  gate.aiReview.reviewers` (no dashboard/DB column). Unlike {@link aiReviewOnMerge}, WHICH reviewers run
+   *  carries no operator floor to violate (the floor is what triggers a hold/block, not who evaluates it), so a
+   *  repo override always wins unclamped when set. */
+  aiReviewReviewers?: ReadonlyArray<{ model: string; fallback?: string | null | undefined }> | null | undefined;
   /** When TRUE, the repo OWNER's (and maintainer's) own PRs are eligible for auto-CLOSE like a contributor's
    *  (still subject to the `close` autonomy class + the same adverse-signal conditions). Default FALSE — owner
    *  PRs are exempt from auto-close (merge or manual-hold only). Per-repo configurable so maintainers choose
@@ -602,6 +706,29 @@ export type RepositorySettings = {
   autoLabelEnabled: boolean;
   gittensorLabel: string;
   createMissingLabel: boolean;
+  /** #label-decoupling: independently gates the per-PR TYPE/taxonomy label (bug/feature by the PR
+   *  title, or priority via linked-issue label propagation — see `resolvePrTypeLabel` in
+   *  `settings/pr-type-label.ts`). Distinct from {@link autoLabelEnabled} (which governs only the
+   *  base {@link gittensorLabel} context label) and from `decidePublicSurface`'s public-surface gate
+   *  (miner detection / `publicAudienceMode` / `includeMaintainerAuthors` / bot-author exclusion) —
+   *  type labels are internal triage metadata applied unconditionally to every PR, not a
+   *  contributor-facing signal, so neither of those public-surface conditions should suppress them.
+   *  Default TRUE (matches the prior de-facto behavior before this field existed, when type labels
+   *  were gated by `autoLabelEnabled` nested inside the public-surface check). Always populated by
+   *  the DB layer; optional so existing settings fixtures/callers need not be touched. */
+  typeLabelsEnabled?: boolean | undefined;
+  /** Per-repo override of the three TYPE/taxonomy label NAMES (#priority-linked-issue-gate). Defaults
+   *  to `DEFAULT_TYPE_LABELS` (`gittensor:bug`/`gittensor:feature`/`gittensor:priority`) in
+   *  `settings/pr-type-label.ts` — a repo can override just one name (e.g. only `priority`) and keep
+   *  the other two default. Always populated by the DB layer; optional so existing settings
+   *  fixtures/callers need not be touched. */
+  typeLabels?: PrTypeLabelSet | undefined;
+  /** Linked-issue label propagation (#priority-linked-issue-gate): the ONLY mechanism that can ever
+   *  select the configured priority label (or any other configured mapping's PR label) — never
+   *  inferred from a PR's title, changed files, AI output, or existing PR labels. Default disabled
+   *  (`enabled: false`, no mappings) — a self-hoster opts in per repo. Always populated by the DB
+   *  layer; optional so existing settings fixtures/callers need not be touched. */
+  linkedIssueLabelPropagation?: LinkedIssueLabelPropagationConfig | undefined;
   publicSurface: "off" | "comment_and_label" | "comment_only" | "label_only";
   includeMaintainerAuthors: boolean;
   requireLinkedIssue: boolean;
@@ -618,9 +745,11 @@ export type RepositorySettings = {
   contributorBlacklist?: ContributorBlacklistEntry[] | undefined;
   /** The label applied to a blacklisted contributor's PR (#1425). Configurable per-repo (dashboard/DB +
    *  `.gittensory.yml` `settings.blacklistLabel`); defaults to `"slop"` so the disposition works regardless of
-   *  the label a repo sets. Always populated by the DB layer (default `"slop"`); optional so existing settings
-   *  fixtures/callers need not be touched (mirrors the sibling `contributorBlacklist`). */
-  blacklistLabel?: string | undefined;
+   *  the label a repo sets. Explicit `null` closes WITHOUT applying any label (the same load-bearing-null idiom
+   *  as {@link contributorOpenPrCap}) -- distinct from omitted/undefined, which uses the default. Always
+   *  populated by the DB layer (default `"slop"`); optional so existing settings fixtures/callers need not be
+   *  touched (mirrors the sibling `contributorBlacklist`). */
+  blacklistLabel?: string | null | undefined;
   /** Per-contributor open-PR cap (#2270, anti-abuse): the max PRs a single non-owner/admin/bot contributor may
    *  have open on this repo at once. `null`/absent (default) = no cap, byte-identical to today. Layered like
    *  every other settings field (`.gittensory.yml` `settings.contributorOpenPrCap` > DB > `null`). Enforcement
@@ -630,10 +759,19 @@ export type RepositorySettings = {
    *  applied to open issues instead of open PRs. `null`/absent (default) = no cap. */
   contributorOpenIssueCap?: number | null | undefined;
   /** The label applied to a PR/issue closed for exceeding a per-contributor open-item cap (#2270). Same
-   *  configurable-with-fallback shape as {@link blacklistLabel}; defaults to `"over-contributor-limit"` so the
-   *  disposition works regardless of the label a repo sets. Always populated by the DB layer; optional so
-   *  existing settings fixtures/callers need not be touched. */
-  contributorCapLabel?: string | undefined;
+   *  configurable-with-fallback shape as {@link blacklistLabel} (including the explicit-`null`-closes-without-a-
+   *  label idiom); defaults to `"over-contributor-limit"` so the disposition works regardless of the label a
+   *  repo sets. Always populated by the DB layer; optional so existing settings fixtures/callers need not be
+   *  touched. */
+  contributorCapLabel?: string | null | undefined;
+  /** Cancel in-flight CI runs on a contributor_cap close (#2462, anti-abuse): when true, after a PR is
+   *  auto-closed for exceeding {@link contributorOpenPrCap}, gittensory lists and cancels that PR's
+   *  in-progress/queued Actions runs at its head SHA. Requires the App installation to have granted
+   *  `actions: write` -- degrades gracefully (skipped + logged, never blocks the close) when it hasn't.
+   *  `null`/undefined (the DB-layer default) means "unset" and falls back to the
+   *  `CONTRIBUTOR_CAP_CANCEL_CI_DEFAULT` env var -- unlike most boolean toggles, this one is nullable so an
+   *  explicit `false` (opt back out) is distinguishable from "not configured" for that fallback. */
+  contributorCapCancelCi?: boolean | null | undefined;
   /** Review-request nagging cooldown (#2463, anti-abuse): throttle a contributor repeatedly pinging
    *  `@gittensory` (any command) on this repo. `"off"` (default) is a no-op; `"hold"` posts a deterministic
    *  cooldown reply and takes no further action; `"close"` additionally closes the thread (PR threads only in
@@ -651,9 +789,19 @@ export type RepositorySettings = {
    *  touched. */
   reviewNagCooldownDays?: number | undefined;
   /** The label applied to a thread closed for review-nag cooldown (#2463), mirroring {@link blacklistLabel}'s
-   *  configurable-with-fallback shape. Always populated by the DB layer (default `"review-nag-cooldown"`);
-   *  optional so existing settings fixtures/callers need not be touched. */
-  reviewNagLabel?: string | undefined;
+   *  configurable-with-fallback shape (including the explicit-`null`-closes-without-a-label idiom). Always
+   *  populated by the DB layer (default `"review-nag-cooldown"`); optional so existing settings
+   *  fixtures/callers need not be touched. */
+  reviewNagLabel?: string | null | undefined;
+  /** Maintainer-mention nag moderation: GitHub logins to ALSO throttle under the review-nag cooldown when the
+   *  thread author repeatedly @-mentions them (on top of the bot's own `@gittensory` handle) -- e.g. a
+   *  maintainer login instead of the bot, for a contributor who keeps tagging a specific person for review.
+   *  Counted independently per mentioned login and independently of the `@gittensory` counter, but reuses the
+   *  SAME {@link reviewNagPolicy}/{@link reviewNagMaxPings}/{@link reviewNagCooldownDays}/{@link reviewNagLabel}
+   *  thresholds/action/label -- one cooldown policy, multiple watched mention targets. `[]`/undefined (default)
+   *  = no logins watched, zero behavior change. Never fires for the repo owner, admin logins, automation bots,
+   *  or a login on {@link autoCloseExemptLogins}. */
+  reviewNagMonitoredMentions?: string[] | undefined;
   /** Shared repo-scoped exemption list (#2463, anti-abuse): GitHub logins that are NEVER throttled or closed by
    *  gittensory's deterministic anti-abuse mechanisms (review-nag and the per-contributor open-item cap above),
    *  on top of the standing owner/admin/automation-bot exemption. Always populated by the DB layer (default
@@ -676,6 +824,28 @@ export type RepositorySettings = {
    *  configurable-with-fallback shape. Always populated by the DB layer (default `"new-account"`); optional so
    *  existing settings fixtures/callers need not be touched. */
   newAccountLabel?: string | undefined;
+  /** Per-command @gittensory rate limit (#2560, anti-abuse): generalizes the review-nag cooldown's counting
+   *  pattern (the audit-events ledger) to EVERY `@gittensory` command, keyed by `(actor, command, targetKey)` --
+   *  independent of, and complementary to, review-nag's own narrower thread-author-only scope. `"off"` (default)
+   *  is a no-op; `"hold"` posts a deterministic cooldown reply and skips the command's own dispatch. Always
+   *  populated by the DB layer (default `"off"`); optional so existing settings fixtures/callers need not be
+   *  touched. */
+  commandRateLimitPolicy?: "off" | "hold" | undefined;
+  /** Per-command rate limit (#2560): how many invocations of a single command an actor may make within
+   *  {@link commandRateLimitWindowHours} before the (N+1)th is throttled -- for a CHEAP command (cache-only,
+   *  no AI orchestrator call). Always populated by the DB layer (default `20`); optional so existing settings
+   *  fixtures/callers need not be touched. Only meaningful when {@link commandRateLimitPolicy} is not `"off"`. */
+  commandRateLimitMaxPerWindow?: number | undefined;
+  /** Per-command rate limit (#2560): the same threshold as {@link commandRateLimitMaxPerWindow}, but for an
+   *  AI-cost-bearing command (dispatches to a real orchestrator call: `ask`, `blockers`, `preflight`,
+   *  `reviewability`, `packet`, `duplicate-check`, `next-action`, `repo-fit`). Deliberately tighter than the
+   *  cheap-command default. Always populated by the DB layer (default `5`); optional so existing settings
+   *  fixtures/callers need not be touched. */
+  commandRateLimitAiMaxPerWindow?: number | undefined;
+  /** Per-command rate limit (#2560): the rolling window (in hours) both {@link commandRateLimitMaxPerWindow}
+   *  and {@link commandRateLimitAiMaxPerWindow} count against. Always populated by the DB layer (default `24`);
+   *  optional so existing settings fixtures/callers need not be touched. */
+  commandRateLimitWindowHours?: number | undefined;
   /** Agent-layer autonomy dial (#773): per-action-class level. Always populated by the DB layer (default
    *  `{}` = deny-by-default = "observe" for every class); optional so existing settings fixtures/callers
    *  need not be touched. The single source the action layer (#778) reads via `resolveAutonomy`. */
@@ -689,6 +859,21 @@ export type RepositorySettings = {
   /** Per-repo dry-run/shadow mode (#776): when true, the action layer records what it WOULD do without
    *  performing any GitHub mutation. Default false. */
   agentDryRun?: boolean | undefined;
+  /** Moderation-rules engine (#selfhost-mod-engine): whether the whole layer runs on THIS repo. `"inherit"`
+   *  (the DB default) defers to `global_moderation_config.enabled`; `"off"`/`"enabled"` force this repo
+   *  regardless of the global default. Always populated by the DB layer; optional so existing settings
+   *  fixtures/callers need not be touched. */
+  moderationGateMode?: "inherit" | "off" | "enabled" | undefined;
+  /** Moderation-rules engine: a per-repo override of WHICH of the three existing anti-abuse mechanisms
+   *  (contributor cap, blacklist, review-nag) feed a contributor's shared, cross-repo violation tally.
+   *  `undefined`/absent ⇒ inherit the global rule set (`resolveEffectiveModerationRules`'s default shape). */
+  moderationRules?: ("contributor_cap" | "blacklist" | "review_nag")[] | undefined;
+  /** Moderation-rules engine: per-repo override of the label applied at >=1 lifetime violation. `undefined` ⇒
+   *  the global config's `warningLabel` (itself defaulting to `"mod:warning"`). */
+  moderationWarningLabel?: string | undefined;
+  /** Moderation-rules engine: per-repo override of the label applied at >= the ban threshold. `undefined` ⇒
+   *  the global config's `bannedLabel` (itself defaulting to `"mod:banned"`). */
+  moderationBannedLabel?: string | undefined;
   createdAt?: string | null | undefined;
   updatedAt?: string | null | undefined;
 };
@@ -698,6 +883,35 @@ export type CommandAuthorizationRole = "maintainer" | "collaborator" | "pr_autho
 export type RepositoryCommandAuthorizationPolicy = {
   default: CommandAuthorizationRole[];
   commands: Record<string, CommandAuthorizationRole[]>;
+};
+
+/** The three per-repo-configurable TYPE/taxonomy label names (#priority-linked-issue-gate). See
+ *  `resolvePrTypeLabel` in `settings/pr-type-label.ts`. */
+export type PrTypeLabelSet = {
+  bug: string;
+  feature: string;
+  priority: string;
+};
+
+/** One linked-issue → PR label mapping (#priority-linked-issue-gate). See
+ *  `LinkedIssueLabelPropagationConfig` below and `review/linked-issue-label-propagation.ts`. */
+export type LinkedIssueLabelPropagationMapping = {
+  issueLabel: string;
+  prLabel: string;
+  removeOtherTypeLabels: boolean;
+};
+
+export type LinkedIssueLabelPropagationMode = "exclusive_type_label";
+
+/** Config-driven propagation of a linked/closing issue's GitHub label onto the PR
+ *  (#priority-linked-issue-gate). Built so a maintainer-reward/bonus label (e.g. `gittensor:priority`)
+ *  can never be inferred from a PR's title, changed files, AI output, or existing PR labels -- only
+ *  ever copied from a linked issue that already carries it. See
+ *  `review/linked-issue-label-propagation.ts` for the normalizer and the fetch orchestrator. */
+export type LinkedIssueLabelPropagationConfig = {
+  enabled: boolean;
+  mode: LinkedIssueLabelPropagationMode;
+  mappings: LinkedIssueLabelPropagationMapping[];
 };
 
 /** A blocked contributor (#1425, anti-abuse): a GitHub `login` plus optional maintainer metadata. The converged
@@ -718,8 +932,15 @@ export type ContributorBlacklistEntry = {
  *  executing; `auto_with_approval` executes behind a human approval gate (#779); `auto` executes directly. */
 export type AutonomyLevel = "observe" | "suggest" | "propose" | "auto_with_approval" | "auto";
 
-/** The write-action classes the maintainer auto-maintain layer (#778) can take on a PR. */
-export type AgentActionClass = "review" | "request_changes" | "approve" | "merge" | "close" | "label" | "update_branch";
+/** The write-action classes the maintainer auto-maintain layer (#778) can take on a PR. `label` gates the
+ *  anti-abuse enforcement labels tied 1:1 to a `close` in the same disposition (blacklist/contributor-cap/
+ *  review-nag) -- those additionally require `close` to be acting, so `label` alone can't apply them without a
+ *  close. `review_state_label` is a SEPARATE, independent gate for the planner's own disposition-communication
+ *  labels (ready-to-merge / changes-requested / needs-human-review / migration-collision / the linked-issue
+ *  pending-closure flag / the account-age new-account label) -- these are advisory signals about the bot's own
+ *  verdict, not enforcement actions, and default OFF (`observe`) like every other class so a one-shot-mode repo
+ *  never sees them without an explicit opt-in. */
+export type AgentActionClass = "review" | "request_changes" | "approve" | "merge" | "close" | "label" | "review_state_label" | "update_branch";
 
 /** Per-action-class autonomy. An unset class resolves to `observe` (deny-by-default). */
 export type AutonomyPolicy = Partial<Record<AgentActionClass, AutonomyLevel>>;
@@ -1256,6 +1477,11 @@ export type InstallationHealthRecord = {
   events: string[];
   checkedAt: string;
   errorSummary?: string | null | undefined;
+  // "broker" = a brokered self-host (ORB_ENROLLMENT_SECRET set, no local GitHub App private key by design).
+  // Permission snapshots are available only after the broker returns token permissions; event subscriptions are
+  // not introspectable through the broker. Consumers must branch on authMode, not infer certainty from empty
+  // arrays alone.
+  authMode: "local" | "broker";
 };
 
 export type ScoringModelSnapshotRecord = {
