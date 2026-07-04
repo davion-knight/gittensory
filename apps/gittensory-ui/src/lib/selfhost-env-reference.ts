@@ -7,7 +7,11 @@ export type SelfHostEnvReferenceRow = {
 export const SELFHOST_ENV_REFERENCE_ROWS: SelfHostEnvReferenceRow[] = [
   {
     name: "AI_COMBINE",
-    firstReference: "src/selfhost/ai.ts:982",
+    firstReference: "src/selfhost/ai.ts:1000",
+  },
+  {
+    name: "AI_DUAL_REVIEW",
+    firstReference: "src/selfhost/ai.ts:975",
   },
   {
     name: "AI_EMBED_API_KEY",
@@ -23,7 +27,7 @@ export const SELFHOST_ENV_REFERENCE_ROWS: SelfHostEnvReferenceRow[] = [
   },
   {
     name: "AI_ON_MERGE",
-    firstReference: "src/selfhost/ai.ts:984",
+    firstReference: "src/selfhost/ai.ts:1002",
   },
   {
     name: "AI_PROVIDER",
@@ -291,7 +295,7 @@ export const SELFHOST_ENV_REFERENCE_ROWS: SelfHostEnvReferenceRow[] = [
   },
   {
     name: "PGPOOL_MAX",
-    firstReference: "src/selfhost/queue-common.ts:710",
+    firstReference: "src/selfhost/queue-common.ts:713",
   },
   {
     name: "PGVECTOR_ENABLED",
@@ -327,11 +331,11 @@ export const SELFHOST_ENV_REFERENCE_ROWS: SelfHostEnvReferenceRow[] = [
   },
   {
     name: "QUEUE_DEAD_LETTER_AUTO_RETRY_MAX_EXTRA_ATTEMPTS",
-    firstReference: "src/selfhost/queue-common.ts:718",
+    firstReference: "src/selfhost/queue-common.ts:721",
   },
   {
     name: "QUEUE_STARTUP_JITTER_MIN_JOBS",
-    firstReference: "src/selfhost/queue-common.ts:699",
+    firstReference: "src/selfhost/queue-common.ts:702",
   },
   {
     name: "REDIS_URL",
@@ -386,11 +390,12 @@ export const SELFHOST_ENV_REFERENCE_ROWS: SelfHostEnvReferenceRow[] = [
 export const SELFHOST_ENV_REFERENCE_MARKDOWN = [
   "| Name | First reference |",
   "| --- | --- |",
-  "| `AI_COMBINE` | `src/selfhost/ai.ts:982` |",
+  "| `AI_COMBINE` | `src/selfhost/ai.ts:1000` |",
+  "| `AI_DUAL_REVIEW` | `src/selfhost/ai.ts:975` |",
   "| `AI_EMBED_API_KEY` | `src/server.ts:440` |",
   "| `AI_EMBED_BASE_URL` | `src/server.ts:437` |",
   "| `AI_EMBED_MODEL` | `src/selfhost/ai.ts:872` |",
-  "| `AI_ON_MERGE` | `src/selfhost/ai.ts:984` |",
+  "| `AI_ON_MERGE` | `src/selfhost/ai.ts:1002` |",
   "| `AI_PROVIDER` | `src/selfhost/ai-config.ts:43` |",
   "| `ANTHROPIC_AI_BASE_URL` | `src/selfhost/ai.ts:876` |",
   "| `ANTHROPIC_AI_MODEL` | `src/selfhost/ai.ts:85` |",
@@ -457,7 +462,7 @@ export const SELFHOST_ENV_REFERENCE_MARKDOWN = [
   "| `OTEL_TRACES_EXPORTER` | `src/selfhost/otel.ts:40` |",
   "| `OTEL_TRACES_SAMPLER` | `src/selfhost/otel.ts:74` |",
   "| `OTEL_TRACES_SAMPLER_ARG` | `src/selfhost/otel.ts:76` |",
-  "| `PGPOOL_MAX` | `src/selfhost/queue-common.ts:710` |",
+  "| `PGPOOL_MAX` | `src/selfhost/queue-common.ts:713` |",
   "| `PGVECTOR_ENABLED` | `src/server.ts:229` |",
   "| `PORT` | `src/server.ts:715` |",
   "| `PUBLIC_API_ORIGIN` | `src/selfhost/preflight.ts:192` |",
@@ -466,8 +471,8 @@ export const SELFHOST_ENV_REFERENCE_MARKDOWN = [
   "| `QDRANT_URL` | `src/server.ts:527` |",
   "| `QUEUE_BACKGROUND_CONCURRENCY` | `src/selfhost/queue-common.ts:130` |",
   "| `QUEUE_CONCURRENCY` | `src/selfhost/pg-queue.ts:285` |",
-  "| `QUEUE_DEAD_LETTER_AUTO_RETRY_MAX_EXTRA_ATTEMPTS` | `src/selfhost/queue-common.ts:718` |",
-  "| `QUEUE_STARTUP_JITTER_MIN_JOBS` | `src/selfhost/queue-common.ts:699` |",
+  "| `QUEUE_DEAD_LETTER_AUTO_RETRY_MAX_EXTRA_ATTEMPTS` | `src/selfhost/queue-common.ts:721` |",
+  "| `QUEUE_STARTUP_JITTER_MIN_JOBS` | `src/selfhost/queue-common.ts:702` |",
   "| `REDIS_URL` | `src/selfhost/preflight.ts:144` |",
   "| `REVIEW_AUDIT_DIR` | `src/server.ts:572` |",
   "| `SELFHOST_BUNDLE_ALL` | `scripts/build-selfhost.mjs:13` |",
