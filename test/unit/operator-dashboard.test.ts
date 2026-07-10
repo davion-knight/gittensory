@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildOperatorDashboardPayload, latestUsageRollup } from "../../src/services/operator-dashboard";
+import {
+  buildOperatorDashboardPayload,
+  latestUsageRollup,
+} from "../../src/services/operator-dashboard";
 import type { ProductUsageDailyRollupRecord } from "../../src/types";
 import { createTestEnv } from "../helpers/d1";
 
@@ -8,7 +11,9 @@ const FORBIDDEN_EXPORT_TERMS =
 
 describe("operator dashboard payload", () => {
   it("builds operator metrics from product usage rollups without sensitive strings", async () => {
-    const env = createTestEnv({ PRODUCT_USAGE_HASH_SALT: "operator-dashboard-test-salt" });
+    const env = createTestEnv({
+      PRODUCT_USAGE_HASH_SALT: "operator-dashboard-test-salt",
+    });
     const payload = await buildOperatorDashboardPayload(env);
     const serialized = JSON.stringify(payload);
 
@@ -20,8 +25,13 @@ describe("operator dashboard payload", () => {
       ]),
     );
     expect(payload.weeklyValueReport.variant).toBe("operator");
-    expect(payload.usageSummary).toMatchObject({ totalEvents: expect.any(Number), activeActors: expect.any(Number) });
-    expect(payload.commandUsefulness.totals).toMatchObject({ feedbackCount: expect.any(Number) });
+    expect(payload.usageSummary).toMatchObject({
+      totalEvents: expect.any(Number),
+      activeActors: expect.any(Number),
+    });
+    expect(payload.commandUsefulness.totals).toMatchObject({
+      feedbackCount: expect.any(Number),
+    });
     expect(serialized).not.toMatch(FORBIDDEN_EXPORT_TERMS);
     // #2191: gate-eval report is surfaced read-only; with no review_audit signal it fails safe to an empty
     // report (no rows, no signal) rather than being absent.
@@ -33,11 +43,22 @@ describe("operator dashboard payload", () => {
       distribution: [],
       sampleSize: 0,
     });
+    // #2192: no merged PRs → ten empty calibration bins, no signal, no recommended floor.
+    expect(payload.calibration.bins).toHaveLength(10);
+    expect(payload.calibration).toMatchObject({
+      mergedCount: 0,
+      hasSignal: false,
+      recommendedFloor: null,
+    });
     // Empty fleet → instanceCount 0, null precision card ("—"), no-outlier delta.
     expect(payload.fleetMetrics.instanceCount).toBe(0);
     expect(payload.metrics).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ label: "Fleet instances", value: "0", delta: "self-host fleet" }),
+        expect.objectContaining({
+          label: "Fleet instances",
+          value: "0",
+          delta: "self-host fleet",
+        }),
         expect.objectContaining({ label: "Fleet merge precision", value: "—" }),
       ]),
     );
@@ -46,10 +67,15 @@ describe("operator dashboard payload", () => {
   it("surfaces populated fleet metrics + outliers from orb_signals", async () => {
     const env = createTestEnv();
     let n = 0;
-    const seed = async (instance: string, count: number, outcome: string): Promise<void> => {
+    const seed = async (
+      instance: string,
+      count: number,
+      outcome: string,
+    ): Promise<void> => {
       for (let i = 0; i < count; i++) {
-        await env.DB
-          .prepare(`INSERT INTO orb_signals (instance_id, repo_hash, pr_hash, gate_verdict, outcome, reversal_flag) VALUES (?, ?, ?, 'merge', ?, 'none')`)
+        await env.DB.prepare(
+          `INSERT INTO orb_signals (instance_id, repo_hash, pr_hash, gate_verdict, outcome, reversal_flag) VALUES (?, ?, ?, 'merge', ?, 'none')`,
+        )
           .bind(instance, `r${n}`, `p${n++}`, outcome)
           .run();
       }
@@ -58,15 +84,28 @@ describe("operator dashboard payload", () => {
     await seed("good2", 5, "merged"); // precision 1.0
     await seed("bad", 5, "closed"); // precision 0.0 → outlier vs the median (1.0)
     for (const id of ["good1", "good2", "bad"]) {
-      await env.DB.prepare(`INSERT INTO orb_instances (instance_id, registered) VALUES (?, 1)`).bind(id).run(); // only registered instances count
+      await env.DB.prepare(
+        `INSERT INTO orb_instances (instance_id, registered) VALUES (?, 1)`,
+      )
+        .bind(id)
+        .run(); // only registered instances count
     }
     const payload = await buildOperatorDashboardPayload(env);
     expect(payload.fleetMetrics.instanceCount).toBe(3);
-    expect(payload.fleetMetrics.outliers.map((o) => o.instanceId)).toContain("bad");
+    expect(payload.fleetMetrics.outliers.map((o) => o.instanceId)).toContain(
+      "bad",
+    );
     expect(payload.metrics).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ label: "Fleet instances", value: "3", delta: "1 outlier(s)" }),
-        expect.objectContaining({ label: "Fleet merge precision", value: "100%" }),
+        expect.objectContaining({
+          label: "Fleet instances",
+          value: "3",
+          delta: "1 outlier(s)",
+        }),
+        expect.objectContaining({
+          label: "Fleet merge precision",
+          value: "100%",
+        }),
       ]),
     );
   });
